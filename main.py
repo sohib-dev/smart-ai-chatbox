@@ -23,14 +23,10 @@ load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
-
 MODELS_CHAIN = [
-    "gemini-3.8-flash",
-    "gemini-3.5-flash",
     "gemini-2.5-flash",
-    "gemini-2.0-flash",
+    "gemini-2.5-flash-lite",
 ]
-
 app = FastAPI(title="Sovereign Agentic AI")
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
@@ -383,27 +379,21 @@ def delete_session(session_id: str, authorization: Optional[str] = Header(None))
     conn.close()
     return {"status": "deleted"}
 
-
 def generate_with_fallback(contents, config):
     last_err = None
     for model_name in MODELS_CHAIN:
-        for attempt in range(2):
-            try:
-                res = gemini_client.models.generate_content(
-                    model=model_name,
-                    contents=contents,
-                    config=config,
-                )
-                if res and res.text:
-                    return res.text
-            except Exception as e:
-                last_err = e
-                err_str = str(e)
-                if "503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str:
-                    time.sleep(0.8)
-                    continue
-                break
-    raise RuntimeError(f"All AI cores busy right now ({last_err})")
+        try:
+            res = gemini_client.models.generate_content(
+                model=model_name,
+                contents=contents,
+                config=config,
+            )
+            if res and res.text:
+                return res.text
+        except Exception as e:
+            last_err = e
+            continue
+    raise RuntimeError(f"AI Error: {last_err}")
 
 
 @app.post("/api/chat")
