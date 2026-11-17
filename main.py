@@ -4,10 +4,12 @@ import uuid
 import time
 import hashlib
 import secrets
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
 import psycopg2
+from psycopg2 import pool
 from psycopg2.extras import RealDictCursor
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import HTMLResponse
@@ -23,91 +25,126 @@ load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
+
 MODELS_CHAIN = [
-    "gemini-3.5-flash-lite",
-    "gemini-3.5-flash",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash",
 ]
+
 app = FastAPI(title="Sovereign Agentic AI")
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 tavily_client = TavilyClient(api_key=TAVILY_API_KEY) if TAVILY_API_KEY else None
 
+# --- Connection Pool for Fast & Glitch-Free DB Access ---
+db_pool = None
+if DATABASE_URL:
+    try:
+        db_pool = pool.ThreadedConnectionPool(1, 12, dsn=DATABASE_URL)
+    except Exception as e:
+        print("Pool warning:", e)
 
-def get_db():
+
+@contextmanager
+def get_db_cursor():
     if not DATABASE_URL:
         raise HTTPException(status_code=500, detail="DATABASE_URL not configured")
-    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+    conn = None
+    from_pool = False
+    try:
+        if db_pool:
+            conn = db_pool.getconn()
+            from_pool = True
+        else:
+            conn = psycopg2.connect(DATABASE_URL)
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        yield conn, cur
+        conn.commit()
+    except Exception:
+        if conn:
+            conn.rollback()
+        raise
+    finally:
+        if conn:
+            try:
+                cur.close()
+            except Exception:
+                pass
+            if from_pool and db_pool:
+                db_pool.putconn(conn)
+            else:
+                conn.close()
 
 
 def init_db():
     if not DATABASE_URL:
         return
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id TEXT PRIMARY KEY,
-            username TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            auth_token TEXT UNIQUE,
-            bio TEXT DEFAULT 'Sovereign Explorer',
-            avatar_seed TEXT DEFAULT 'dragon',
-            spiritual_coins INTEGER DEFAULT 0,
-            daily_coins_earned INTEGER DEFAULT 0,
-            last_coin_date TEXT DEFAULT '',
-            unlocked_modes TEXT DEFAULT '["standard"]',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-    """)
-    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_seed TEXT DEFAULT 'dragon';")
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS sessions (
-            id TEXT PRIMARY KEY,
-            user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-            title TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS messages (
-            id SERIAL PRIMARY KEY,
-            session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-            role TEXT NOT NULL,
-            content TEXT NOT NULL,
-            tools_used TEXT DEFAULT '[]',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS user_memories (
-            id SERIAL PRIMARY KEY,
-            user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-            fact TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS friendships (
-            id SERIAL PRIMARY KEY,
-            requester_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-            receiver_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-            status TEXT NOT NULL DEFAULT 'pending',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(requester_id, receiver_id)
-        );
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS direct_messages (
-            id SERIAL PRIMARY KEY,
-            sender_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-            receiver_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-            content TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-    """)
-    conn.commit()
-    cur.close()
-    conn.close()
+    with get_db_cursor() as (conn, cur):
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id TEXT PRIMARY KEY,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                auth_token TEXT UNIQUE,
+                bio TEXT DEFAULT 'Sovereign Explorer',
+                avatar_seed TEXT DEFAULT '',
+                spiritual_coins INTEGER DEFAULT 0,
+                daily_coins_earned INTEGER DEFAULT 0,
+                last_coin_date TEXT DEFAULT '',
+                unlocked_modes TEXT DEFAULT '["standard"]',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_seed TEXT DEFAULT '';")
+        cur.execute("ALTER TABLE users ALTER COLUMN avatar_seed TYPE TEXT;")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                title TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id SERIAL PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                tools_used TEXT DEFAULT '[]',
+                files_json TEXT DEFAULT '[]',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        cur.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS files_json TEXT DEFAULT '[]';")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS user_memories (
+                id SERIAL PRIMARY KEY,
+                user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                fact TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS friendships (
+                id SERIAL PRIMARY KEY,
+                requester_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                receiver_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(requester_id, receiver_id)
+            );
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS direct_messages (
+                id SERIAL PRIMARY KEY,
+                sender_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                receiver_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                content TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
 
 
 try:
@@ -124,58 +161,49 @@ def get_current_user(authorization: Optional[str] = Header(None)):
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Not authenticated")
     token = authorization.split(" ", 1)[1].strip()
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM users WHERE auth_token = %s", (token,))
-    user = cur.fetchone()
-    if not user:
-        cur.close()
-        conn.close()
-        raise HTTPException(status_code=401, detail="Invalid session token")
+    if not token:
+        raise HTTPException(status_code=401, detail="Empty token")
 
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    if user["last_coin_date"] != today_str:
-        cur.execute(
-            "UPDATE users SET daily_coins_earned = 0, last_coin_date = %s WHERE id = %s",
-            (today_str, user["id"]),
-        )
-        conn.commit()
-        user["daily_coins_earned"] = 0
-        user["last_coin_date"] = today_str
+    with get_db_cursor() as (conn, cur):
+        cur.execute("SELECT * FROM users WHERE auth_token = %s", (token,))
+        user = cur.fetchone()
+        if not user:
+            raise HTTPException(status_code=401, detail="Session expired, please login again")
 
-    cur.close()
-    conn.close()
-    return user
+        user = dict(user)
+        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if user["last_coin_date"] != today_str:
+            cur.execute(
+                "UPDATE users SET daily_coins_earned = 0, last_coin_date = %s WHERE id = %s",
+                (today_str, user["id"]),
+            )
+            user["daily_coins_earned"] = 0
+            user["last_coin_date"] = today_str
+        return user
 
 
 def award_spiritual_coins(user_id: str, amount: int) -> dict:
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT spiritual_coins, daily_coins_earned, last_coin_date FROM users WHERE id = %s",
-        (user_id,),
-    )
-    row = cur.fetchone()
-    if not row:
-        cur.close()
-        conn.close()
-        return {"coins": 0, "daily": 0, "added": 0}
+    with get_db_cursor() as (conn, cur):
+        cur.execute(
+            "SELECT spiritual_coins, daily_coins_earned, last_coin_date FROM users WHERE id = %s",
+            (user_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return {"coins": 0, "daily": 0, "added": 0}
 
-    daily = row["daily_coins_earned"] if row["last_coin_date"] == today_str else 0
-    remaining = max(0, 30 - daily)
-    actual_add = min(amount, remaining)
-    new_total = row["spiritual_coins"] + actual_add
-    new_daily = daily + actual_add
+        daily = row["daily_coins_earned"] if row["last_coin_date"] == today_str else 0
+        remaining = max(0, 30 - daily)
+        actual_add = min(amount, remaining)
+        new_total = row["spiritual_coins"] + actual_add
+        new_daily = daily + actual_add
 
-    cur.execute(
-        "UPDATE users SET spiritual_coins = %s, daily_coins_earned = %s, last_coin_date = %s WHERE id = %s",
-        (new_total, new_daily, today_str, user_id),
-    )
-    conn.commit()
-    cur.close()
-    conn.close()
-    return {"coins": new_total, "daily": new_daily, "added": actual_add}
+        cur.execute(
+            "UPDATE users SET spiritual_coins = %s, daily_coins_earned = %s, last_coin_date = %s WHERE id = %s",
+            (new_total, new_daily, today_str, user_id),
+        )
+        return {"coins": new_total, "daily": new_daily, "added": actual_add}
 
 
 # --- Pydantic Models ---
@@ -186,7 +214,7 @@ class AuthRequest(BaseModel):
 
 class ProfileUpdate(BaseModel):
     bio: str
-    avatar_seed: str = "dragon"
+    avatar_data: Optional[str] = None
 
 
 class UnlockModeRequest(BaseModel):
@@ -218,88 +246,94 @@ class DMPayload(BaseModel):
 def register(req: AuthRequest):
     uname = req.username.strip()
     if len(uname) < 3 or len(req.password) < 4:
-        raise HTTPException(status_code=400, detail="Username >= 3 chars & password >= 4 chars required")
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT id FROM users WHERE LOWER(username) = LOWER(%s)", (uname,))
-    if cur.fetchone():
-        cur.close()
-        conn.close()
-        raise HTTPException(status_code=400, detail="Username already taken")
+        raise HTTPException(status_code=400, detail="Username min 3 chars & password min 4 chars required")
+    with get_db_cursor() as (conn, cur):
+        cur.execute("SELECT id FROM users WHERE LOWER(username) = LOWER(%s)", (uname,))
+        if cur.fetchone():
+            raise HTTPException(status_code=400, detail="Username already taken")
 
-    uid = str(uuid.uuid4())
-    token = secrets.token_hex(32)
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    cur.execute(
-        """INSERT INTO users (id, username, password_hash, auth_token, last_coin_date)
-           VALUES (%s, %s, %s, %s, %s)""",
-        (uid, uname, hash_password(req.password), token, today_str),
-    )
-    conn.commit()
-    cur.close()
-    conn.close()
-    return {"token": token, "username": uname}
+        uid = str(uuid.uuid4())
+        token = secrets.token_hex(32)
+        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        cur.execute(
+            """INSERT INTO users (id, username, password_hash, auth_token, last_coin_date, avatar_seed)
+               VALUES (%s, %s, %s, %s, %s, '')""",
+            (uid, uname, hash_password(req.password), token, today_str),
+        )
+        return {"token": token, "username": uname}
 
 
 @app.post("/api/auth/login")
 def login(req: AuthRequest):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT id, username, password_hash FROM users WHERE LOWER(username) = LOWER(%s)",
-        (req.username.strip(),),
-    )
-    user = cur.fetchone()
-    if not user or user["password_hash"] != hash_password(req.password):
-        cur.close()
-        conn.close()
-        raise HTTPException(status_code=401, detail="Invalid username or password")
+    uname = req.username.strip()
+    if not uname or not req.password:
+        raise HTTPException(status_code=400, detail="Enter username and password")
+    with get_db_cursor() as (conn, cur):
+        cur.execute(
+            "SELECT id, username, password_hash, auth_token FROM users WHERE LOWER(username) = LOWER(%s)",
+            (uname,),
+        )
+        user = cur.fetchone()
+        if not user or user["password_hash"] != hash_password(req.password):
+            raise HTTPException(status_code=401, detail="Wrong username or password")
 
-    token = secrets.token_hex(32)
-    cur.execute("UPDATE users SET auth_token = %s WHERE id = %s", (token, user["id"]))
-    conn.commit()
-    cur.close()
-    conn.close()
-    return {"token": token, "username": user["username"]}
+        token = user["auth_token"] or secrets.token_hex(32)
+        if not user["auth_token"]:
+            cur.execute("UPDATE users SET auth_token = %s WHERE id = %s", (token, user["id"]))
+        return {"token": token, "username": user["username"]}
 
 
 @app.get("/api/me")
 def get_me(authorization: Optional[str] = Header(None)):
     user = get_current_user(authorization)
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT id, fact FROM user_memories WHERE user_id = %s ORDER BY id DESC", (user["id"],))
-    memories = cur.fetchall()
-    cur.execute("SELECT COUNT(*) AS cnt FROM sessions WHERE user_id = %s", (user["id"],))
-    sess_count = cur.fetchone()["cnt"]
-    cur.close()
-    conn.close()
-    return {
-        "id": user["id"],
-        "username": user["username"],
-        "bio": user["bio"],
-        "avatar_seed": user.get("avatar_seed") or "dragon",
-        "spiritual_coins": user["spiritual_coins"],
-        "daily_coins_earned": user["daily_coins_earned"],
-        "unlocked_modes": json.loads(user["unlocked_modes"] or '["standard"]'),
-        "memories": memories,
-        "session_count": sess_count,
-    }
+    with get_db_cursor() as (conn, cur):
+        cur.execute("SELECT id, fact FROM user_memories WHERE user_id = %s ORDER BY id DESC", (user["id"],))
+        memories = cur.fetchall()
+        cur.execute("SELECT COUNT(*) AS cnt FROM sessions WHERE user_id = %s", (user["id"],))
+        sess_count = cur.fetchone()["cnt"]
+        avatar = user.get("avatar_seed") or ""
+        if not avatar.startswith("data:image/"):
+            avatar = ""
+        return {
+            "id": user["id"],
+            "username": user["username"],
+            "bio": user["bio"],
+            "avatar_data": avatar,
+            "spiritual_coins": user["spiritual_coins"],
+            "daily_coins_earned": user["daily_coins_earned"],
+            "unlocked_modes": json.loads(user["unlocked_modes"] or '["standard"]'),
+            "memories": memories,
+            "session_count": sess_count,
+        }
+
+
+@app.delete("/api/memories/{mem_id}")
+def delete_memory(mem_id: int, authorization: Optional[str] = Header(None)):
+    user = get_current_user(authorization)
+    with get_db_cursor() as (conn, cur):
+        cur.execute("DELETE FROM user_memories WHERE id = %s AND user_id = %s", (mem_id, user["id"]))
+        return {"status": "deleted"}
 
 
 @app.post("/api/me/profile")
 def update_profile(payload: ProfileUpdate, authorization: Optional[str] = Header(None)):
     user = get_current_user(authorization)
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE users SET bio = %s, avatar_seed = %s WHERE id = %s",
-        (payload.bio[:200], payload.avatar_seed[:30], user["id"]),
-    )
-    conn.commit()
-    cur.close()
-    conn.close()
-    return {"status": "ok"}
+    with get_db_cursor() as (conn, cur):
+        if payload.avatar_data is not None:
+            if payload.avatar_data != "" and not payload.avatar_data.startswith("data:image/"):
+                raise HTTPException(status_code=400, detail="Invalid image format")
+            if len(payload.avatar_data) > 450000:
+                raise HTTPException(status_code=400, detail="Image too large")
+            cur.execute(
+                "UPDATE users SET bio = %s, avatar_seed = %s WHERE id = %s",
+                (payload.bio[:200], payload.avatar_data, user["id"]),
+            )
+        else:
+            cur.execute(
+                "UPDATE users SET bio = %s WHERE id = %s",
+                (payload.bio[:200], user["id"]),
+            )
+        return {"status": "ok"}
 
 
 @app.post("/api/modes/unlock")
@@ -319,81 +353,69 @@ def unlock_mode(payload: UnlockModeRequest, authorization: Optional[str] = Heade
 
     new_coins = user["spiritual_coins"] - cost
     unlocked.append(payload.mode)
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE users SET spiritual_coins = %s, unlocked_modes = %s WHERE id = %s",
-        (new_coins, json.dumps(unlocked), user["id"]),
-    )
-    conn.commit()
-    cur.close()
-    conn.close()
-    return {"unlocked_modes": unlocked, "spiritual_coins": new_coins}
+    with get_db_cursor() as (conn, cur):
+        cur.execute(
+            "UPDATE users SET spiritual_coins = %s, unlocked_modes = %s WHERE id = %s",
+            (new_coins, json.dumps(unlocked), user["id"]),
+        )
+        return {"unlocked_modes": unlocked, "spiritual_coins": new_coins}
 
 
 # --- Sessions & Chat ---
 @app.get("/api/sessions")
 def list_sessions(authorization: Optional[str] = Header(None)):
     user = get_current_user(authorization)
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT id, title, created_at FROM sessions WHERE user_id = %s ORDER BY created_at DESC",
-        (user["id"],),
-    )
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
-    return rows
+    with get_db_cursor() as (conn, cur):
+        cur.execute(
+            "SELECT id, title, created_at FROM sessions WHERE user_id = %s ORDER BY created_at DESC",
+            (user["id"],),
+        )
+        return cur.fetchall()
 
 
 @app.get("/api/sessions/{session_id}")
 def get_session_messages(session_id: str, authorization: Optional[str] = Header(None)):
     user = get_current_user(authorization)
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT id FROM sessions WHERE id = %s AND user_id = %s", (session_id, user["id"]))
-    if not cur.fetchone():
-        cur.close()
-        conn.close()
-        raise HTTPException(status_code=404, detail="Session not found")
+    with get_db_cursor() as (conn, cur):
+        cur.execute("SELECT id FROM sessions WHERE id = %s AND user_id = %s", (session_id, user["id"]))
+        if not cur.fetchone():
+            raise HTTPException(status_code=404, detail="Session not found")
 
-    cur.execute(
-        "SELECT role, content, tools_used FROM messages WHERE session_id = %s ORDER BY id ASC",
-        (session_id,),
-    )
-    msgs = cur.fetchall()
-    cur.close()
-    conn.close()
-    return msgs
+        cur.execute(
+            "SELECT role, content, tools_used, files_json FROM messages WHERE session_id = %s ORDER BY id ASC",
+            (session_id,),
+        )
+        return cur.fetchall()
 
 
 @app.delete("/api/sessions/{session_id}")
 def delete_session(session_id: str, authorization: Optional[str] = Header(None)):
     user = get_current_user(authorization)
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM sessions WHERE id = %s AND user_id = %s", (session_id, user["id"]))
-    conn.commit()
-    cur.close()
-    conn.close()
-    return {"status": "deleted"}
+    with get_db_cursor() as (conn, cur):
+        cur.execute("DELETE FROM sessions WHERE id = %s AND user_id = %s", (session_id, user["id"]))
+        return {"status": "deleted"}
+
 
 def generate_with_fallback(contents, config):
     last_err = None
     for model_name in MODELS_CHAIN:
-        try:
-            res = gemini_client.models.generate_content(
-                model=model_name,
-                contents=contents,
-                config=config,
-            )
-            if res and res.text:
-                return res.text
-        except Exception as e:
-            last_err = e
-            continue
-    raise RuntimeError(f"AI Error: {last_err}")
+        for attempt in range(2):
+            try:
+                res = gemini_client.models.generate_content(
+                    model=model_name,
+                    contents=contents,
+                    config=config,
+                )
+                if res and res.text:
+                    return res.text
+            except Exception as e:
+                last_err = e
+                err_str = str(e)
+                if "503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str:
+                    time.sleep(0.8)
+                    continue
+                break
+    raise RuntimeError(f"All AI cores busy right now ({last_err})")
 
 
 @app.post("/api/chat")
@@ -405,41 +427,33 @@ def chat_endpoint(req: ChatRequest, authorization: Optional[str] = Header(None))
     unlocked = json.loads(user["unlocked_modes"] or '["standard"]')
     active_mode = req.mode if req.mode in unlocked else "standard"
 
-    conn = get_db()
-    cur = conn.cursor()
+    with get_db_cursor() as (conn, cur):
+        session_id = req.session_id
+        if not session_id:
+            session_id = str(uuid.uuid4())
+            title = req.message.strip()[:42] or "New Task"
+            cur.execute(
+                "INSERT INTO sessions (id, user_id, title) VALUES (%s, %s, %s)",
+                (session_id, user["id"], title),
+            )
+        else:
+            cur.execute("SELECT id FROM sessions WHERE id = %s AND user_id = %s", (session_id, user["id"]))
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail="Session not found")
 
-    session_id = req.session_id
-    if not session_id:
-        session_id = str(uuid.uuid4())
-        title = req.message.strip()[:42] or "New Task"
         cur.execute(
-            "INSERT INTO sessions (id, user_id, title) VALUES (%s, %s, %s)",
-            (session_id, user["id"], title),
+            "INSERT INTO messages (session_id, role, content) VALUES (%s, 'user', %s)",
+            (session_id, req.message),
         )
-        conn.commit()
-    else:
-        cur.execute("SELECT id FROM sessions WHERE id = %s AND user_id = %s", (session_id, user["id"]))
-        if not cur.fetchone():
-            cur.close()
-            conn.close()
-            raise HTTPException(status_code=404, detail="Session not found")
 
-    cur.execute(
-        "INSERT INTO messages (session_id, role, content) VALUES (%s, 'user', %s)",
-        (session_id, req.message),
-    )
-    conn.commit()
+        cur.execute(
+            "SELECT role, content FROM messages WHERE session_id = %s ORDER BY id DESC LIMIT 12",
+            (session_id,),
+        )
+        history_rows = list(reversed(cur.fetchall()))
 
-    cur.execute(
-        "SELECT role, content FROM messages WHERE session_id = %s ORDER BY id DESC LIMIT 12",
-        (session_id,),
-    )
-    history_rows = list(reversed(cur.fetchall()))
-
-    cur.execute("SELECT fact FROM user_memories WHERE user_id = %s ORDER BY id DESC LIMIT 15", (user["id"],))
-    mem_rows = cur.fetchall()
-    cur.close()
-    conn.close()
+        cur.execute("SELECT fact FROM user_memories WHERE user_id = %s ORDER BY id DESC LIMIT 15", (user["id"],))
+        mem_rows = cur.fetchall()
 
     memories_text = "\n".join(f"- {m['fact']}" for m in mem_rows) if mem_rows else "None saved yet."
     tools_used = []
@@ -480,13 +494,15 @@ def chat_endpoint(req: ChatRequest, authorization: Optional[str] = Header(None))
         """Save an important user preference, goal, or fact to long-term cloud memory."""
         if "Core Memory" not in tools_used:
             tools_used.append("Core Memory")
-        c = get_db()
-        cr = c.cursor()
-        cr.execute("INSERT INTO user_memories (user_id, fact) VALUES (%s, %s)", (user["id"], fact.strip()))
-        c.commit()
-        cr.close()
-        c.close()
-        return f"Saved to long-term memory: {fact}"
+        clean_fact = fact.strip()
+        with get_db_cursor() as (c, cr):
+            cr.execute(
+                "SELECT id FROM user_memories WHERE user_id = %s AND LOWER(fact) = LOWER(%s)",
+                (user["id"], clean_fact),
+            )
+            if not cr.fetchone():
+                cr.execute("INSERT INTO user_memories (user_id, fact) VALUES (%s, %s)", (user["id"], clean_fact))
+        return f"Saved to long-term memory: {clean_fact}"
 
     def create_downloadable_file(filename: str, content: str) -> str:
         """Generate a downloadable code, markdown, CSV, or text file for the user."""
@@ -503,7 +519,11 @@ def chat_endpoint(req: ChatRequest, authorization: Optional[str] = Header(None))
         "overdrive": "SOVEREIGN OVERDRIVE MODE: Combine deep multi-step reasoning, strategic foresight, and elite execution clarity.",
     }
 
-    system_instruction = f"""You are SOVEREIGN, an autonomous agentic intelligence.
+    system_instruction = f"""You are SOVEREIGN, an autonomous agentic intelligence built and created by Sohib (@sohib-dev).
+CRITICAL IDENTITY RULE:
+- You were created, engineered, and built by Sohib (also known as Sohib28 / @sohib-dev).
+- NEVER say you were created, trained, or made by Google, DeepMind, or anyone else. If anyone asks who created/made/built you, always proudly state that Sohib created you.
+
 Active Reasoning Mode: {active_mode.upper()} — {mode_directives.get(active_mode, mode_directives['standard'])}
 User Profile: {user['username']} | Bio: {user['bio']}
 User Long-Term Memories:
@@ -532,19 +552,11 @@ Rules:
     except Exception as e:
         reply_text = f"Temporarily overloaded—try again in a moment. ({e})"
 
-    if generated_files:
-        for gf in generated_files:
-            reply_text += f"\n\n[FILE_READY::{gf['filename']}::{gf['content']}]"
-
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO messages (session_id, role, content, tools_used) VALUES (%s, 'assistant', %s, %s)",
-        (session_id, reply_text, json.dumps(tools_used)),
-    )
-    conn.commit()
-    cur.close()
-    conn.close()
+    with get_db_cursor() as (conn, cur):
+        cur.execute(
+            "INSERT INTO messages (session_id, role, content, tools_used, files_json) VALUES (%s, 'assistant', %s, %s, %s)",
+            (session_id, reply_text, json.dumps(tools_used), json.dumps(generated_files)),
+        )
 
     bonus = 2 if "overdrive" in unlocked else 0
     coin_reward = (10 if tools_used else 5) + bonus
@@ -554,136 +566,138 @@ Rules:
         "session_id": session_id,
         "reply": reply_text,
         "tools_used": tools_used,
+        "files": generated_files,
         "coins": coin_status,
     }
 
 
-# --- Social & Direct Messaging ---
+# --- Social & Instagram-Style Direct Messaging ---
 @app.get("/api/users/search")
 def search_exact_user(username: str, authorization: Optional[str] = Header(None)):
     me = get_current_user(authorization)
     q = username.strip()
     if not q:
         return {"user": None}
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT id, username, bio, spiritual_coins FROM users WHERE LOWER(username) = LOWER(%s) AND id != %s",
-        (q, me["id"]),
-    )
-    target = cur.fetchone()
-    if not target:
-        cur.close()
-        conn.close()
-        return {"user": None}
+    with get_db_cursor() as (conn, cur):
+        cur.execute(
+            "SELECT id, username, bio, spiritual_coins, avatar_seed FROM users WHERE LOWER(username) = LOWER(%s) AND id != %s",
+            (q, me["id"]),
+        )
+        target = cur.fetchone()
+        if not target:
+            return {"user": None}
 
-    cur.execute(
-        """SELECT id, status, requester_id FROM friendships
-           WHERE (requester_id = %s AND receiver_id = %s) OR (requester_id = %s AND receiver_id = %s)""",
-        (me["id"], target["id"], target["id"], me["id"]),
-    )
-    rel = cur.fetchone()
-    cur.close()
-    conn.close()
-    return {"user": target, "relation": rel}
+        target = dict(target)
+        av = target.get("avatar_seed") or ""
+        target["avatar_data"] = av if av.startswith("data:image/") else ""
+
+        cur.execute(
+            """SELECT id, status, requester_id FROM friendships
+               WHERE (requester_id = %s AND receiver_id = %s) OR (requester_id = %s AND receiver_id = %s)""",
+            (me["id"], target["id"], target["id"], me["id"]),
+        )
+        rel = cur.fetchone()
+        return {"user": target, "relation": rel}
 
 
 @app.post("/api/friends/request")
 def send_friend_request(payload: FriendRequestPayload, authorization: Optional[str] = Header(None)):
     me = get_current_user(authorization)
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT id FROM users WHERE LOWER(username) = LOWER(%s)", (payload.username.strip(),))
-    target = cur.fetchone()
-    if not target or target["id"] == me["id"]:
-        cur.close()
-        conn.close()
-        raise HTTPException(status_code=404, detail="User not found")
+    with get_db_cursor() as (conn, cur):
+        cur.execute("SELECT id FROM users WHERE LOWER(username) = LOWER(%s)", (payload.username.strip(),))
+        target = cur.fetchone()
+        if not target or target["id"] == me["id"]:
+            raise HTTPException(status_code=404, detail="User not found")
 
-    cur.execute(
-        """SELECT id FROM friendships
-           WHERE (requester_id = %s AND receiver_id = %s) OR (requester_id = %s AND receiver_id = %s)""",
-        (me["id"], target["id"], target["id"], me["id"]),
-    )
-    if cur.fetchone():
-        cur.close()
-        conn.close()
-        return {"status": "exists"}
+        cur.execute(
+            """SELECT id FROM friendships
+               WHERE (requester_id = %s AND receiver_id = %s) OR (requester_id = %s AND receiver_id = %s)""",
+            (me["id"], target["id"], target["id"], me["id"]),
+        )
+        if cur.fetchone():
+            return {"status": "exists"}
 
-    cur.execute(
-        "INSERT INTO friendships (requester_id, receiver_id, status) VALUES (%s, %s, 'pending')",
-        (me["id"], target["id"]),
-    )
-    conn.commit()
-    cur.close()
-    conn.close()
-    return {"status": "sent"}
+        cur.execute(
+            "INSERT INTO friendships (requester_id, receiver_id, status) VALUES (%s, %s, 'pending')",
+            (me["id"], target["id"]),
+        )
+        return {"status": "sent"}
 
 
 @app.get("/api/friends")
 def get_friends_and_requests(authorization: Optional[str] = Header(None)):
     me = get_current_user(authorization)
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        """SELECT f.id AS friendship_id, u.id, u.username, u.bio, u.spiritual_coins
-           FROM friendships f
-           JOIN users u ON u.id = f.requester_id
-           WHERE f.receiver_id = %s AND f.status = 'pending'""",
-        (me["id"],),
-    )
-    incoming = cur.fetchall()
+    with get_db_cursor() as (conn, cur):
+        cur.execute(
+            """SELECT f.id AS friendship_id, u.id, u.username, u.bio, u.spiritual_coins, u.avatar_seed
+               FROM friendships f
+               JOIN users u ON u.id = f.requester_id
+               WHERE f.receiver_id = %s AND f.status = 'pending'""",
+            (me["id"],),
+        )
+        incoming_raw = cur.fetchall()
+        incoming = []
+        for r in incoming_raw:
+            d = dict(r)
+            av = d.get("avatar_seed") or ""
+            d["avatar_data"] = av if av.startswith("data:image/") else ""
+            incoming.append(d)
 
-    cur.execute(
-        """SELECT u.id, u.username, u.bio, u.spiritual_coins
-           FROM friendships f
-           JOIN users u ON (u.id = CASE WHEN f.requester_id = %s THEN f.receiver_id ELSE f.requester_id END)
-           WHERE (f.requester_id = %s OR f.receiver_id = %s) AND f.status = 'accepted'""",
-        (me["id"], me["id"], me["id"]),
-    )
-    friends = cur.fetchall()
-    cur.close()
-    conn.close()
-    return {"incoming": incoming, "friends": friends}
+        cur.execute(
+            """SELECT u.id, u.username, u.bio, u.spiritual_coins, u.avatar_seed
+               FROM friendships f
+               JOIN users u ON (u.id = CASE WHEN f.requester_id = %s THEN f.receiver_id ELSE f.requester_id END)
+               WHERE (f.requester_id = %s OR f.receiver_id = %s) AND f.status = 'accepted'""",
+            (me["id"], me["id"], me["id"]),
+        )
+        friends_raw = cur.fetchall()
+        friends = []
+        for f in friends_raw:
+            d = dict(f)
+            av = d.get("avatar_seed") or ""
+            d["avatar_data"] = av if av.startswith("data:image/") else ""
+            cur.execute(
+                """SELECT content, sender_id, created_at FROM direct_messages
+                   WHERE (sender_id = %s AND receiver_id = %s) OR (sender_id = %s AND receiver_id = %s)
+                   ORDER BY id DESC LIMIT 1""",
+                (me["id"], d["id"], d["id"], me["id"]),
+            )
+            last_msg = cur.fetchone()
+            d["last_message"] = last_msg["content"] if last_msg else "Tap to start chatting"
+            friends.append(d)
+
+        return {"incoming": incoming, "friends": friends}
 
 
 @app.post("/api/friends/respond")
 def respond_friend_request(payload: FriendRespondPayload, authorization: Optional[str] = Header(None)):
     me = get_current_user(authorization)
-    conn = get_db()
-    cur = conn.cursor()
-    if payload.action == "accept":
-        cur.execute(
-            "UPDATE friendships SET status = 'accepted' WHERE id = %s AND receiver_id = %s",
-            (payload.friendship_id, me["id"]),
-        )
-    else:
-        cur.execute(
-            "DELETE FROM friendships WHERE id = %s AND receiver_id = %s",
-            (payload.friendship_id, me["id"]),
-        )
-    conn.commit()
-    cur.close()
-    conn.close()
-    return {"status": "ok"}
+    with get_db_cursor() as (conn, cur):
+        if payload.action == "accept":
+            cur.execute(
+                "UPDATE friendships SET status = 'accepted' WHERE id = %s AND receiver_id = %s",
+                (payload.friendship_id, me["id"]),
+            )
+        else:
+            cur.execute(
+                "DELETE FROM friendships WHERE id = %s AND receiver_id = %s",
+                (payload.friendship_id, me["id"]),
+            )
+        return {"status": "ok"}
 
 
 @app.get("/api/dm/{friend_id}")
 def get_dm_history(friend_id: str, authorization: Optional[str] = Header(None)):
     me = get_current_user(authorization)
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        """SELECT id, sender_id, receiver_id, content, created_at
-           FROM direct_messages
-           WHERE (sender_id = %s AND receiver_id = %s) OR (sender_id = %s AND receiver_id = %s)
-           ORDER BY id ASC LIMIT 100""",
-        (me["id"], friend_id, friend_id, me["id"]),
-    )
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
-    return rows
+    with get_db_cursor() as (conn, cur):
+        cur.execute(
+            """SELECT id, sender_id, receiver_id, content, created_at
+               FROM direct_messages
+               WHERE (sender_id = %s AND receiver_id = %s) OR (sender_id = %s AND receiver_id = %s)
+               ORDER BY id ASC LIMIT 120""",
+            (me["id"], friend_id, friend_id, me["id"]),
+        )
+        return cur.fetchall()
 
 
 @app.post("/api/dm")
@@ -691,24 +705,20 @@ def send_dm(payload: DMPayload, authorization: Optional[str] = Header(None)):
     me = get_current_user(authorization)
     if not payload.content.strip():
         raise HTTPException(status_code=400, detail="Empty message")
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO direct_messages (sender_id, receiver_id, content) VALUES (%s, %s, %s)",
-        (me["id"], payload.receiver_id, payload.content.strip()),
-    )
-    conn.commit()
-    cur.close()
-    conn.close()
-    return {"status": "sent"}
+    with get_db_cursor() as (conn, cur):
+        cur.execute(
+            "INSERT INTO direct_messages (sender_id, receiver_id, content) VALUES (%s, %s, %s)",
+            (me["id"], payload.receiver_id, payload.content.strip()),
+        )
+        return {"status": "sent"}
 
 
-# --- Particle Background + Floating Glass Pad + Instagram 3-Tab Dock + Gamer Profile + Tactile Audio ---
+# --- Pro UI: Clickable Popping Bubbles + Sleek Auth + Gallery PFP + 4-Tab Dock (Home, Chat, Upgrade, Profile) ---
 HTML_UI = """<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
   <title>Sovereign — Autonomous Agentic Intelligence</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -716,70 +726,94 @@ HTML_UI = """<!DOCTYPE html>
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <style>
     :root {
-      --bg-deep: #07080C;
-      --glass-bg: rgba(17, 20, 29, 0.72);
-      --glass-strong: rgba(22, 26, 38, 0.85);
+      --bg-deep: #06070A;
+      --glass-bg: rgba(16, 19, 28, 0.72);
+      --glass-strong: rgba(20, 24, 36, 0.88);
       --border-light: rgba(255, 255, 255, 0.09);
-      --border-glow: rgba(16, 185, 129, 0.35);
       --text-main: #F3F4F6;
       --text-sub: #9CA3AF;
       --text-dim: #6B7280;
       --accent: #10B981;
       --accent-glow: rgba(16, 185, 129, 0.25);
-      --gold: #F59E0B;
-      --purple: #8B5CF6;
     }
 
-    * { box-sizing: border-box; margin: 0; padding: 0; }
+    * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
     body {
       font-family: 'Inter', -apple-system, sans-serif;
-      background: var(--bg-deep);
+      background: radial-gradient(circle at 50% 0%, #0E1320 0%, #06070A 75%);
       color: var(--text-main);
       height: 100vh;
       overflow: hidden;
       -webkit-font-smoothing: antialiased;
     }
 
-    /* 60fps Particle Canvas */
-    #particleCanvas {
+    /* Interactive Popping Bubbles Canvas */
+    #bubbleCanvas {
       position: fixed;
       inset: 0;
       width: 100vw;
       height: 100vh;
       z-index: 0;
-      pointer-events: none;
+      cursor: pointer;
     }
 
-    ::-webkit-scrollbar { width: 5px; }
+    ::-webkit-scrollbar { width: 4px; }
     ::-webkit-scrollbar-track { background: transparent; }
-    ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.12); border-radius: 99px; }
+    ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.14); border-radius: 99px; }
 
-    /* Auth Screen */
+    /* Sleek Pro Auth Screen */
     #authScreen {
       position: fixed; inset: 0; z-index: 100;
       display: flex; align-items: center; justify-content: center;
-      padding: 20px; background: rgba(7, 8, 12, 0.78); backdrop-filter: blur(14px);
+      padding: 20px; background: rgba(6, 7, 10, 0.76); backdrop-filter: blur(18px);
     }
     .auth-card {
-      width: 100%; max-width: 390px;
-      background: var(--glass-strong);
-      border: 1px solid var(--border-light);
-      border-radius: 24px; padding: 34px 30px;
-      box-shadow: 0 24px 70px rgba(0,0,0,0.75);
+      width: 100%; max-width: 400px;
+      background: linear-gradient(160deg, rgba(24, 28, 42, 0.92), rgba(12, 14, 22, 0.96));
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      border-radius: 26px; padding: 34px 28px;
+      box-shadow: 0 28px 80px rgba(0,0,0,0.85), inset 0 1px 0 rgba(255,255,255,0.08);
     }
+    .auth-logo {
+      width: 48px; height: 48px; border-radius: 14px; margin: 0 auto 14px;
+      background: linear-gradient(135deg, #10B981, #059669);
+      display: flex; align-items: center; justify-content: center;
+      font-weight: 800; font-size: 20px; color: #032218;
+      box-shadow: 0 10px 28px rgba(16, 185, 129, 0.35);
+    }
+    .auth-tabs {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 6px;
+      background: rgba(6, 7, 10, 0.75); padding: 5px;
+      border-radius: 14px; border: 1px solid var(--border-light);
+      margin-bottom: 20px;
+    }
+    .auth-tab-btn {
+      padding: 9px; border-radius: 10px; border: none;
+      background: transparent; color: var(--text-sub);
+      font-size: 13px; font-weight: 600; cursor: pointer; transition: all 0.18s;
+    }
+    .auth-tab-btn.active {
+      background: rgba(255, 255, 255, 0.1); color: #FFF;
+    }
+    .input-wrap { position: relative; margin-bottom: 13px; }
     .field {
-      width: 100%; background: rgba(7, 8, 12, 0.85);
+      width: 100%; background: rgba(6, 7, 10, 0.85);
       border: 1px solid var(--border-light);
-      border-radius: 13px; padding: 12px 15px;
+      border-radius: 13px; padding: 13px 15px;
       color: var(--text-main); font-size: 14px; outline: none;
       transition: border-color 0.2s, box-shadow 0.2s;
     }
     .field:focus {
       border-color: var(--accent);
-      box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.14);
+      box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.15);
+    }
+    .eye-btn {
+      position: absolute; right: 12px; top: 50%; transform: translateY(-50%);
+      background: none; border: none; color: var(--text-sub);
+      font-size: 12px; font-weight: 600; cursor: pointer; padding: 4px;
     }
     .btn-primary {
-      width: 100%; padding: 12px 16px; border-radius: 13px;
+      width: 100%; padding: 13px 16px; border-radius: 13px;
       background: linear-gradient(135deg, #10B981, #059669);
       color: #032218; font-weight: 700; font-size: 14px;
       border: none; cursor: pointer;
@@ -788,42 +822,46 @@ HTML_UI = """<!DOCTYPE html>
     }
     .btn-primary:hover { filter: brightness(1.08); }
     .btn-primary:active { transform: scale(0.98); }
+    .btn-primary:disabled { opacity: 0.55; cursor: not-allowed; }
     .btn-ghost {
       width: 100%; padding: 11px 16px; border-radius: 13px;
-      background: rgba(255,255,255,0.04); color: var(--text-sub);
+      background: rgba(255,255,255,0.05); color: var(--text-sub);
       border: 1px solid var(--border-light); font-weight: 600; font-size: 13px;
-      cursor: pointer; margin-top: 10px;
+      cursor: pointer;
     }
-    .btn-ghost:hover { background: rgba(255,255,255,0.08); color: var(--text-main); }
+    .btn-ghost:hover { background: rgba(255,255,255,0.09); color: var(--text-main); }
 
-    /* App Shell */
+    /* App Shell (pointer-events:none so clicks on empty space pop bubbles!) */
     #appShell {
       position: relative; z-index: 1;
       display: none; height: 100vh; width: 100vw;
       flex-direction: column;
+      pointer-events: none;
+    }
+    .top-bar, .history-drawer, .content-col, .floating-pad, .ig-dock {
+      pointer-events: auto;
     }
 
-    /* Top Floating Glass Bar */
+    /* Top Floating Bar */
     .top-bar {
-      height: 62px; padding: 0 20px;
+      height: 62px; padding: 0 18px;
       display: flex; align-items: center; justify-content: space-between;
       z-index: 20;
     }
-    .top-left, .top-right { display: flex; align-items: center; gap: 10px; }
+    .top-left, .top-right { display: flex; align-items: center; gap: 8px; }
     .icon-pill {
       height: 38px; padding: 0 13px; border-radius: 99px;
       background: var(--glass-bg); backdrop-filter: blur(16px);
       border: 1px solid var(--border-light);
       color: var(--text-main); font-size: 13px; font-weight: 600;
-      display: flex; align-items: center; gap: 7px; cursor: pointer;
+      display: flex; align-items: center; gap: 6px; cursor: pointer;
       transition: all 0.15s;
     }
-    .icon-pill:hover { border-color: rgba(255,255,255,0.22); transform: translateY(-1px); }
+    .icon-pill:hover { border-color: rgba(255,255,255,0.22); }
 
-    /* Dragon Coin Pill */
     .dragon-pill {
-      height: 40px; padding: 0 14px 0 8px; border-radius: 99px;
-      background: linear-gradient(135deg, rgba(24, 20, 38, 0.85), rgba(15, 18, 26, 0.9));
+      height: 40px; padding: 0 13px 0 8px; border-radius: 99px;
+      background: linear-gradient(135deg, rgba(24, 20, 38, 0.88), rgba(15, 18, 26, 0.92));
       backdrop-filter: blur(16px);
       border: 1px solid rgba(245, 158, 11, 0.35);
       display: flex; align-items: center; gap: 8px;
@@ -831,16 +869,16 @@ HTML_UI = """<!DOCTYPE html>
       cursor: pointer;
     }
     .coin-val { font-weight: 800; font-size: 14px; color: #FBBF24; }
-    .coin-sub { font-size: 11px; color: var(--text-sub); }
+    .coin-sub { font-size: 10.5px; color: var(--text-sub); }
 
-    /* Slide-Out History Drawer */
+    /* History Drawer */
     .history-drawer {
-      position: fixed; top: 68px; left: 18px; bottom: 92px; width: 270px;
+      position: fixed; top: 68px; left: 16px; bottom: 92px; width: 270px;
       background: var(--glass-strong); backdrop-filter: blur(22px);
       border: 1px solid var(--border-light); border-radius: 22px;
       padding: 16px; z-index: 40;
       display: none; flex-direction: column;
-      box-shadow: 0 24px 60px rgba(0,0,0,0.7);
+      box-shadow: 0 24px 60px rgba(0,0,0,0.75);
     }
     .history-drawer.open { display: flex; }
     .sess-list { flex: 1; overflow-y: auto; margin-top: 12px; display: flex; flex-direction: column; gap: 4px; }
@@ -848,58 +886,54 @@ HTML_UI = """<!DOCTYPE html>
       padding: 10px 12px; border-radius: 12px; font-size: 13px; color: var(--text-sub);
       display: flex; justify-content: space-between; align-items: center; cursor: pointer;
     }
-    .sess-item:hover, .sess-item.active { background: rgba(255,255,255,0.07); color: var(--text-main); }
+    .sess-item:hover, .sess-item.active { background: rgba(255,255,255,0.08); color: var(--text-main); }
 
     /* Pages Container */
     .page-area {
-      flex: 1; overflow-y: auto; padding: 10px 20px 210px;
+      flex: 1; overflow-y: auto; padding: 10px 18px 210px;
       display: flex; flex-direction: column; align-items: center;
+      pointer-events: none;
     }
-    .content-col { width: 100%; max-width: 760px; display: flex; flex-direction: column; gap: 20px; }
+    .content-col { width: 100%; max-width: 740px; display: flex; flex-direction: column; gap: 18px; }
 
     /* Hero Greeting */
-    .hero-center {
-      margin: auto; text-align: center; max-width: 600px; padding: 36px 12px;
-    }
+    .hero-center { margin: auto; text-align: center; max-width: 600px; padding: 28px 10px; }
     .hero-glow-tag {
       display: inline-flex; align-items: center; gap: 8px;
       padding: 6px 14px; border-radius: 99px;
       background: rgba(16, 185, 129, 0.12);
       border: 1px solid rgba(16, 185, 129, 0.3);
-      color: #34D399; font-size: 12px; font-weight: 600; margin-bottom: 16px;
+      color: #34D399; font-size: 12px; font-weight: 600; margin-bottom: 14px;
     }
     .hero-title {
-      font-size: 32px; font-weight: 800; letter-spacing: -0.03em;
+      font-size: 30px; font-weight: 800; letter-spacing: -0.03em;
       background: linear-gradient(135deg, #FFFFFF 20%, #9CA3AF 100%);
       -webkit-background-clip: text; -webkit-text-fill-color: transparent;
       margin-bottom: 10px;
     }
-    .hero-sub { font-size: 14.5px; color: var(--text-sub); line-height: 1.6; margin-bottom: 26px; }
-    .quick-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 11px; text-align: left; }
+    .hero-sub { font-size: 14px; color: var(--text-sub); line-height: 1.6; margin-bottom: 24px; }
+    .quick-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; text-align: left; }
     .quick-card {
       background: var(--glass-bg); backdrop-filter: blur(14px);
       border: 1px solid var(--border-light); border-radius: 16px;
       padding: 14px 16px; cursor: pointer; transition: all 0.18s;
     }
-    .quick-card:hover {
-      border-color: var(--accent); transform: translateY(-2px);
-      box-shadow: 0 10px 28px rgba(16, 185, 129, 0.14);
-    }
+    .quick-card:hover { border-color: var(--accent); transform: translateY(-2px); }
 
     /* Chat Bubbles */
     .msg-user {
       align-self: flex-end; max-width: 82%;
-      background: linear-gradient(135deg, rgba(16, 185, 129, 0.22), rgba(6, 78, 59, 0.35));
+      background: linear-gradient(135deg, rgba(16, 185, 129, 0.24), rgba(6, 78, 59, 0.38));
       backdrop-filter: blur(14px);
       border: 1px solid rgba(16, 185, 129, 0.35);
-      padding: 12px 17px; border-radius: 20px 20px 5px 20px;
+      padding: 12px 16px; border-radius: 20px 20px 5px 20px;
       font-size: 14.5px; line-height: 1.55;
     }
     .msg-ai {
-      display: flex; gap: 13px; align-items: flex-start; width: 100%;
+      display: flex; gap: 12px; align-items: flex-start; width: 100%;
       background: var(--glass-bg); backdrop-filter: blur(14px);
       border: 1px solid var(--border-light);
-      padding: 16px 18px; border-radius: 20px;
+      padding: 15px 17px; border-radius: 20px;
     }
     .ai-orb {
       width: 30px; height: 30px; border-radius: 10px; flex-shrink: 0;
@@ -911,9 +945,16 @@ HTML_UI = """<!DOCTYPE html>
     .ai-text p { margin-bottom: 10px; }
     .ai-text p:last-child { margin-bottom: 0; }
     .ai-text pre {
-      background: rgba(7, 8, 12, 0.9); border: 1px solid var(--border-light);
-      border-radius: 12px; padding: 13px; overflow-x: auto; margin: 10px 0;
+      position: relative;
+      background: rgba(6, 7, 10, 0.92); border: 1px solid var(--border-light);
+      border-radius: 12px; padding: 34px 13px 13px; overflow-x: auto; margin: 10px 0;
       font-family: 'JetBrains Mono', monospace; font-size: 12.5px;
+    }
+    .copy-code-btn {
+      position: absolute; top: 7px; right: 8px;
+      background: rgba(255, 255, 255, 0.08); color: var(--text-sub);
+      border: 1px solid var(--border-light); border-radius: 7px;
+      padding: 3px 9px; font-size: 11px; font-weight: 600; cursor: pointer;
     }
     .tool-chip {
       display: inline-block; font-size: 11px; font-family: 'JetBrains Mono', monospace;
@@ -922,39 +963,33 @@ HTML_UI = """<!DOCTYPE html>
       padding: 3px 9px; border-radius: 99px; margin: 0 6px 8px 0;
     }
     .file-dl {
-      margin-top: 10px; display: inline-flex; align-items: center; gap: 10px;
+      margin-top: 10px; margin-right: 8px; display: inline-flex; align-items: center; gap: 10px;
       background: rgba(255,255,255,0.05); border: 1px solid var(--border-light);
       padding: 8px 13px; border-radius: 12px;
     }
 
-    /* Floating Glass Prompt Pad (Above Bottom Dock) */
+    /* Floating Glass Prompt Pad */
     .floating-pad-wrap {
       position: fixed; bottom: 84px; left: 0; right: 0;
-      padding: 0 18px; display: flex; justify-content: center; z-index: 25;
+      padding: 0 16px; display: flex; justify-content: center; z-index: 25;
       pointer-events: none;
     }
     .floating-pad {
-      pointer-events: auto;
       width: 100%; max-width: 740px;
-      background: rgba(20, 24, 35, 0.78);
+      background: rgba(18, 22, 33, 0.82);
       backdrop-filter: blur(24px); -webkit-backdrop-filter: blur(24px);
       border: 1px solid rgba(255, 255, 255, 0.14);
       border-radius: 24px; padding: 12px 14px 12px 18px;
-      box-shadow: 0 18px 50px rgba(0, 0, 0, 0.65), 0 0 30px var(--accent-glow);
-      transition: border-color 0.2s, box-shadow 0.25s, transform 0.2s;
+      box-shadow: 0 18px 50px rgba(0, 0, 0, 0.65), 0 0 28px var(--accent-glow);
+      transition: border-color 0.2s, transform 0.2s;
     }
-    .floating-pad:focus-within {
-      border-color: var(--accent);
-      transform: translateY(-2px);
-    }
+    .floating-pad:focus-within { border-color: var(--accent); transform: translateY(-2px); }
     .pad-textarea {
       width: 100%; background: transparent; border: none; outline: none;
       color: var(--text-main); font-family: inherit; font-size: 14.5px;
       resize: none; max-height: 120px; line-height: 1.5;
     }
-    .pad-controls {
-      display: flex; align-items: center; justify-content: space-between; margin-top: 8px;
-    }
+    .pad-controls { display: flex; align-items: center; justify-content: space-between; margin-top: 8px; }
     .mode-pill-select {
       background: rgba(255,255,255,0.06); color: var(--text-main);
       border: 1px solid var(--border-light); border-radius: 99px;
@@ -967,37 +1002,115 @@ HTML_UI = """<!DOCTYPE html>
       padding: 7px 16px; font-size: 13px; font-weight: 700;
       cursor: pointer; display: flex; align-items: center; gap: 6px;
       box-shadow: 0 4px 16px rgba(16, 185, 129, 0.3);
-      transition: transform 0.12s;
     }
-    .exec-btn:active { transform: scale(0.95); }
     .exec-btn:disabled { opacity: 0.45; cursor: not-allowed; }
 
-    /* Instagram-Style Floating 3-Tab Bottom Navigation Dock */
+    /* Instagram-Style 4-Tab Bottom Navigation Dock */
     .ig-dock-wrap {
       position: fixed; bottom: 16px; left: 0; right: 0;
       display: flex; justify-content: center; z-index: 30; pointer-events: none;
     }
     .ig-dock {
-      pointer-events: auto;
-      background: rgba(16, 19, 28, 0.86);
+      background: rgba(15, 18, 27, 0.9);
       backdrop-filter: blur(22px); -webkit-backdrop-filter: blur(22px);
       border: 1px solid rgba(255, 255, 255, 0.13);
-      border-radius: 99px; padding: 6px 10px;
-      display: flex; align-items: center; gap: 8px;
-      box-shadow: 0 14px 40px rgba(0, 0, 0, 0.75);
+      border-radius: 99px; padding: 6px 8px;
+      display: flex; align-items: center; gap: 4px;
+      box-shadow: 0 14px 40px rgba(0, 0, 0, 0.8);
     }
     .ig-tab {
-      padding: 9px 22px; border-radius: 99px;
+      padding: 9px 16px; border-radius: 99px;
       border: none; background: transparent;
-      color: var(--text-sub); font-size: 13px; font-weight: 600;
-      display: flex; align-items: center; gap: 8px;
+      color: var(--text-sub); font-size: 12.5px; font-weight: 600;
+      display: flex; align-items: center; gap: 6px;
       cursor: pointer; transition: all 0.18s;
     }
     .ig-tab:hover { color: var(--text-main); }
     .ig-tab.active {
-      background: rgba(255, 255, 255, 0.1);
+      background: rgba(255, 255, 255, 0.11);
       color: #FFFFFF;
       box-shadow: inset 0 1px 0 rgba(255,255,255,0.12);
+    }
+
+    /* Professional Avatar Circle */
+    .pro-avatar {
+      border-radius: 50%; object-fit: cover;
+      background: linear-gradient(135deg, #1E293B, #0F172A);
+      border: 2px solid rgba(255,255,255,0.16);
+      display: flex; align-items: center; justify-content: center;
+      font-weight: 800; color: #F3F4F6; overflow: hidden; flex-shrink: 0;
+    }
+    .pro-avatar img { width: 100%; height: 100%; object-fit: cover; }
+
+    /* Professional Profile Card */
+    .pro-profile-card {
+      background: linear-gradient(155deg, rgba(22, 26, 39, 0.92), rgba(12, 15, 23, 0.96));
+      backdrop-filter: blur(22px);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 24px; padding: 24px;
+      box-shadow: 0 20px 50px rgba(0,0,0,0.65);
+    }
+    .pfp-upload-wrap { position: relative; width: 86px; height: 86px; cursor: pointer; }
+    .pfp-cam-badge {
+      position: absolute; bottom: 0; right: 0;
+      width: 28px; height: 28px; border-radius: 50%;
+      background: #10B981; color: #032218;
+      border: 2px solid #0C0F17;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 13px; font-weight: 800;
+    }
+    .tier-badge {
+      display: inline-flex; align-items: center; gap: 5px;
+      padding: 4px 11px; border-radius: 99px;
+      background: rgba(16, 185, 129, 0.12);
+      border: 1px solid rgba(16, 185, 129, 0.35);
+      color: #34D399; font-size: 11px; font-weight: 700; letter-spacing: 0.04em;
+    }
+    .stat-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 20px; }
+    .stat-box {
+      background: rgba(255,255,255,0.035); border: 1px solid var(--border-light);
+      border-radius: 14px; padding: 13px 10px; text-align: center;
+    }
+    .stat-num { font-size: 18px; font-weight: 800; color: #FFFFFF; }
+    .stat-lbl { font-size: 11px; color: var(--text-sub); margin-top: 3px; }
+
+    /* Instagram-Style Dedicated Chat Tab */
+    .ig-chat-shell {
+      background: var(--glass-strong); backdrop-filter: blur(22px);
+      border: 1px solid var(--border-light); border-radius: 24px;
+      overflow: hidden; display: flex; flex-direction: column;
+      height: calc(100vh - 185px); min-height: 440px;
+      box-shadow: 0 20px 55px rgba(0,0,0,0.7);
+    }
+    .ig-chat-topbar {
+      padding: 15px 18px; border-bottom: 1px solid var(--border-light);
+      display: flex; align-items: center; justify-content: space-between;
+    }
+    .ig-friend-row {
+      display: flex; align-items: center; gap: 13px;
+      padding: 13px 18px; border-bottom: 1px solid rgba(255,255,255,0.04);
+      cursor: pointer; transition: background 0.15s;
+    }
+    .ig-friend-row:hover { background: rgba(255,255,255,0.05); }
+    .ig-dm-thread {
+      flex: 1; overflow-y: auto; padding: 16px;
+      display: flex; flex-direction: column; gap: 8px;
+    }
+    .dm-bubble-me {
+      align-self: flex-end; max-width: 76%;
+      background: linear-gradient(135deg, #10B981, #059669);
+      color: #032218; font-weight: 500;
+      padding: 10px 14px; border-radius: 18px 18px 4px 18px; font-size: 13.5px;
+    }
+    .dm-bubble-them {
+      align-self: flex-start; max-width: 76%;
+      background: rgba(255, 255, 255, 0.08);
+      color: #F3F4F6;
+      padding: 10px 14px; border-radius: 18px 18px 18px 4px; font-size: 13.5px;
+    }
+    .ig-dm-compose {
+      padding: 12px 14px; border-top: 1px solid var(--border-light);
+      display: flex; gap: 8px; background: rgba(10, 12, 18, 0.6);
     }
 
     /* Upgrade Store Cards */
@@ -1009,85 +1122,56 @@ HTML_UI = """<!DOCTYPE html>
     }
     .upg-card.unlocked { border-color: rgba(16, 185, 129, 0.4); }
 
-    /* Gamer-Style Profile Card */
-    .gamer-banner {
-      background: linear-gradient(135deg, rgba(24, 28, 44, 0.92), rgba(13, 16, 25, 0.96));
-      backdrop-filter: blur(20px);
-      border: 1px solid rgba(245, 158, 11, 0.28);
-      border-radius: 24px; padding: 24px;
-      position: relative; overflow: hidden;
-      box-shadow: 0 20px 50px rgba(0,0,0,0.6);
-    }
-    .gamer-top { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; }
-    .avatar-ring {
-      width: 84px; height: 84px; border-radius: 50%; padding: 3px;
-      background: linear-gradient(135deg, #F59E0B, #8B5CF6, #10B981);
-      flex-shrink: 0; box-shadow: 0 0 25px rgba(245, 158, 11, 0.35);
-    }
-    .avatar-inner {
-      width: 100%; height: 100%; border-radius: 50%;
-      background: #0B0D13; display: flex; align-items: center; justify-content: center;
-      overflow: hidden;
-    }
-    .rank-badge {
-      display: inline-flex; align-items: center; gap: 6px;
-      padding: 4px 12px; border-radius: 99px;
-      background: rgba(245, 158, 11, 0.15);
-      border: 1px solid rgba(245, 158, 11, 0.4);
-      color: #FBBF24; font-size: 11.5px; font-weight: 700; letter-spacing: 0.04em;
-    }
-    .stat-row {
-      display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 18px;
-    }
-    .stat-box {
-      background: rgba(255,255,255,0.04); border: 1px solid var(--border-light);
-      border-radius: 14px; padding: 12px; text-align: center;
-    }
-    .stat-num { font-size: 18px; font-weight: 800; color: #FFFFFF; }
-    .stat-lbl { font-size: 11px; color: var(--text-sub); margin-top: 2px; }
-    .avatar-picker { display: flex; gap: 8px; margin-top: 10px; }
-    .av-opt {
-      padding: 6px 12px; border-radius: 99px; font-size: 12px; font-weight: 600;
-      background: rgba(255,255,255,0.05); border: 1px solid var(--border-light);
-      color: var(--text-sub); cursor: pointer;
-    }
-    .av-opt.active { border-color: var(--accent); color: #34D399; background: rgba(16, 185, 129, 0.12); }
-
-    /* Social DM Box */
-    .dm-grid { display: grid; grid-template-columns: 220px 1fr; gap: 12px; height: 320px; }
     .glass-box {
       background: var(--glass-strong); border: 1px solid var(--border-light);
-      border-radius: 18px; padding: 14px; overflow-y: auto;
+      border-radius: 20px; padding: 18px;
+    }
+    .mem-row {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 7px 0; border-bottom: 1px solid rgba(255,255,255,0.05);
     }
 
     @media (max-width: 680px) {
-      .quick-grid, .upgrade-grid, .dm-grid { grid-template-columns: 1fr; }
-      .ig-tab { padding: 9px 16px; font-size: 12.5px; }
+      .quick-grid, .upgrade-grid { grid-template-columns: 1fr; }
+      .ig-tab { padding: 8px 13px; font-size: 12px; }
     }
   </style>
 </head>
 <body>
 
-  <canvas id="particleCanvas"></canvas>
+  <!-- Interactive Clickable Floating Bubbles -->
+  <canvas id="bubbleCanvas"></canvas>
 
-  <!-- Auth Screen -->
+  <!-- Sleek Pro Auth Screen -->
   <div id="authScreen">
     <div class="auth-card">
-      <div style="text-align:center;margin-bottom:22px;">
-        <div style="font-size:24px;font-weight:800;letter-spacing:-0.02em;">SOVEREIGN AI</div>
-        <div style="font-size:13px;color:var(--text-sub);margin-top:4px;">Autonomous Agent & Spiritual Progression</div>
+      <div class="auth-logo">S</div>
+      <div style="text-align:center;margin-bottom:20px;">
+        <div style="font-size:21px;font-weight:800;letter-spacing:-0.02em;">Sovereign Workspace</div>
+        <div style="font-size:13px;color:var(--text-sub);margin-top:4px;">Sign in to your autonomous AI terminal</div>
       </div>
-      <input id="authUser" class="field" placeholder="Username" style="margin-bottom:12px;" />
-      <input id="authPass" type="password" class="field" placeholder="Password" style="margin-bottom:14px;" />
-      <div id="authErr" style="color:#F87171;font-size:12.5px;margin-bottom:10px;display:none;"></div>
-      <button class="btn-primary" onclick="submitAuth('login')">Enter Workspace</button>
-      <button class="btn-ghost" onclick="submitAuth('register')">Create New Account</button>
+
+      <div class="auth-tabs">
+        <button class="auth-tab-btn active" id="tabLoginBtn" onclick="setAuthMode('login')">Sign In</button>
+        <button class="auth-tab-btn" id="tabRegBtn" onclick="setAuthMode('register')">Create Account</button>
+      </div>
+
+      <div class="input-wrap">
+        <input id="authUser" class="field" placeholder="Username" autocomplete="username" />
+      </div>
+      <div class="input-wrap">
+        <input id="authPass" type="password" class="field" placeholder="Password" autocomplete="current-password"
+               onkeydown="if(event.key==='Enter') handleAuthSubmit()" />
+        <button type="button" class="eye-btn" onclick="togglePassVisibility()">Show</button>
+      </div>
+
+      <div id="authErr" style="color:#F87171;font-size:12.5px;margin-bottom:12px;display:none;"></div>
+      <button class="btn-primary" id="authSubmitBtn" onclick="handleAuthSubmit()">Sign In</button>
     </div>
   </div>
 
   <!-- Main App Shell -->
   <div id="appShell">
-    <!-- Top Floating Bar -->
     <header class="top-bar">
       <div class="top-left">
         <button class="icon-pill" onclick="toggleDrawer()">☰ History</button>
@@ -1097,7 +1181,6 @@ HTML_UI = """<!DOCTYPE html>
       <div class="top-right">
         <button class="icon-pill" id="soundToggle" onclick="toggleSound()">🔊 SFX</button>
 
-        <!-- Horned Eastern Dragon Spiritual Coin Pill -->
         <div class="dragon-pill" onclick="switchTab('upgrade')" title="Open Upgrade Store">
           <svg viewBox="0 0 64 64" width="28" height="28" xmlns="http://www.w3.org/2000/svg">
             <defs>
@@ -1139,20 +1222,20 @@ HTML_UI = """<!DOCTYPE html>
     <!-- Slide-out Session History Drawer -->
     <div class="history-drawer" id="historyDrawer">
       <div style="display:flex;justify-content:space-between;align-items:center;">
-        <span style="font-size:12px;font-weight:700;letter-spacing:0.06em;color:var(--text-sub);">PAST MISSIONS</span>
+        <span style="font-size:12px;font-weight:700;letter-spacing:0.06em;color:var(--text-sub);">PAST SESSIONS</span>
         <span style="cursor:pointer;color:var(--text-sub);" onclick="toggleDrawer()">✕</span>
       </div>
       <div class="sess-list" id="sessionList"></div>
     </div>
 
-    <!-- TAB 1: HOME (Chat Stage) -->
+    <!-- TAB 1: HOME (AI Chat) -->
     <div class="page-area" id="tabHome">
       <div class="content-col" id="chatFeed">
         <div class="hero-center" id="heroScreen">
           <div class="hero-glow-tag">⚡ Multi-Tool Autonomous Core Active</div>
           <h1 class="hero-title">Command Sovereign AI</h1>
           <p class="hero-sub">
-            Live internet intelligence, symbolic mathematics, permanent cloud memory, and file synthesis. Earn Spiritual Coins with every task to upgrade your AI cores.
+            Live internet intelligence, symbolic mathematics, permanent cloud memory, and file synthesis. Tap background bubbles anytime to pop them.
           </p>
           <div class="quick-grid">
             <div class="quick-card" onclick="quickPrompt('Search the latest AI breakthroughs today and give bullet points.')">
@@ -1176,7 +1259,56 @@ HTML_UI = """<!DOCTYPE html>
       </div>
     </div>
 
-    <!-- TAB 2: UPGRADE STORE -->
+    <!-- TAB 2: CHAT (Instagram-Style Direct Messages) -->
+    <div class="page-area" id="tabChat" style="display:none;padding-bottom:96px;">
+      <div class="content-col">
+        <div class="ig-chat-shell">
+          <!-- View A: Friends Inbox List -->
+          <div id="igInboxView" style="display:flex;flex-direction:column;height:100%;">
+            <div class="ig-chat-topbar">
+              <div>
+                <div style="font-size:17px;font-weight:800;" id="igHeaderUser">Direct Messages</div>
+                <div style="font-size:12px;color:var(--text-sub);">Private encrypted squad channels</div>
+              </div>
+            </div>
+
+            <div style="padding:12px 16px;border-bottom:1px solid var(--border-light);">
+              <div style="display:flex;gap:8px;">
+                <input id="friendSearchInp" class="field" style="padding:10px 14px;font-size:13.5px;" placeholder="Search username to add friend..." />
+                <button class="btn-primary" style="width:auto;padding:10px 18px;" onclick="searchExactFriend()">Search</button>
+              </div>
+              <div id="searchOut" style="margin-top:8px;"></div>
+              <div id="reqOut" style="margin-top:8px;"></div>
+            </div>
+
+            <div style="flex:1;overflow-y:auto;" id="igFriendsList"></div>
+          </div>
+
+          <!-- View B: Active 1-on-1 Chat Thread -->
+          <div id="igThreadView" style="display:none;flex-direction:column;height:100%;">
+            <div class="ig-chat-topbar">
+              <div style="display:flex;align-items:center;gap:12px;">
+                <button class="icon-pill" style="height:32px;padding:0 11px;" onclick="closeIGThread()">←</button>
+                <div id="threadAvatarWrap"></div>
+                <div>
+                  <div style="font-size:15px;font-weight:700;" id="dmTitle">@friend</div>
+                  <div style="font-size:11px;color:#34D399;">● Direct Channel</div>
+                </div>
+              </div>
+            </div>
+
+            <div class="ig-dm-thread" id="dmFeed"></div>
+
+            <div class="ig-dm-compose">
+              <input id="dmText" class="field" style="padding:10px 14px;font-size:13.5px;" placeholder="Message..." onkeydown="if(event.key==='Enter') sendDM()" />
+              <button class="btn-primary" style="width:auto;padding:10px 18px;" onclick="sendDM()">Send</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- TAB 3: UPGRADE STORE -->
     <div class="page-area" id="tabUpgrade" style="display:none;padding-bottom:110px;">
       <div class="content-col">
         <div>
@@ -1191,7 +1323,7 @@ HTML_UI = """<!DOCTYPE html>
             <div>
               <div style="font-size:11px;font-weight:700;color:#34D399;">TIER I · DEFAULT</div>
               <div style="font-size:17px;font-weight:700;margin-top:4px;">Standard Core</div>
-              <div style="font-size:13px;color:var(--text-sub);margin-top:6px;">Fast, direct, multi-tool autonomous execution with emerald aura.</div>
+              <div style="font-size:13px;color:var(--text-sub);margin-top:6px;">Fast, direct, multi-tool autonomous execution with emerald bubbles.</div>
             </div>
             <div style="font-size:12.5px;font-weight:700;color:#34D399;">✓ Equipped & Active</div>
           </div>
@@ -1200,7 +1332,7 @@ HTML_UI = """<!DOCTYPE html>
             <div>
               <div style="font-size:11px;font-weight:700;color:#F59E0B;">TIER II · 50 SPIRITUAL COINS</div>
               <div style="font-size:17px;font-weight:700;margin-top:4px;">Brutal Truth Core</div>
-              <div style="font-size:13px;color:var(--text-sub);margin-top:6px;">Unfiltered razor-sharp critique. Exposes flaws with zero sugarcoating and gold-crimson particles.</div>
+              <div style="font-size:13px;color:var(--text-sub);margin-top:6px;">Unfiltered razor-sharp critique. Exposes flaws with zero sugarcoating and amber bubbles.</div>
             </div>
             <button class="btn-primary" id="btnBrutal" onclick="buyUpgrade('brutal')">Unlock · 50 Coins</button>
           </div>
@@ -1209,7 +1341,7 @@ HTML_UI = """<!DOCTYPE html>
             <div>
               <div style="font-size:11px;font-weight:700;color:#A78BFA;">TIER III · 120 SPIRITUAL COINS</div>
               <div style="font-size:17px;font-weight:700;margin-top:4px;">Principal Architect Core</div>
-              <div style="font-size:13px;color:var(--text-sub);margin-top:6px;">Deep system topology, trade-offs, and royal violet particle aura.</div>
+              <div style="font-size:13px;color:var(--text-sub);margin-top:6px;">Deep system topology, trade-offs, and royal violet bubbles.</div>
             </div>
             <button class="btn-primary" id="btnArchitect" onclick="buyUpgrade('architect')">Unlock · 120 Coins</button>
           </div>
@@ -1226,25 +1358,31 @@ HTML_UI = """<!DOCTYPE html>
       </div>
     </div>
 
-    <!-- TAB 3: GAMER-STYLE PROFILE & FRIENDS -->
+    <!-- TAB 4: PROFESSIONAL PROFILE -->
     <div class="page-area" id="tabProfile" style="display:none;padding-bottom:110px;">
       <div class="content-col">
-        <!-- Gamer Banner Card -->
-        <div class="gamer-banner">
-          <div class="gamer-top">
-            <div class="avatar-ring">
-              <div class="avatar-inner" id="avatarDisplay"></div>
+        <div class="pro-profile-card">
+          <div style="display:flex;align-items:center;gap:18px;flex-wrap:wrap;">
+            <!-- Gallery Uploadable Avatar -->
+            <div class="pfp-upload-wrap" onclick="document.getElementById('pfpFileInput').click()" title="Upload Photo from Gallery">
+              <div id="profileAvatarSlot" class="pro-avatar" style="width:86px;height:86px;font-size:30px;">S</div>
+              <div class="pfp-cam-badge">📷</div>
+              <input type="file" id="pfpFileInput" accept="image/*" style="display:none;" onchange="handleGalleryUpload(event)" />
             </div>
+
             <div style="flex:1;min-width:200px;">
               <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
                 <span style="font-size:22px;font-weight:800;" id="profName">@player</span>
-                <span class="rank-badge" id="profRank">🐉 SPIRIT INITIATE</span>
+                <span class="tier-badge" id="profRank">TIER I · INITIATE</span>
               </div>
-              <div style="font-size:13px;color:var(--text-sub);margin-top:6px;" id="profBioText">Sovereign Explorer</div>
-              <div class="avatar-picker">
-                <button class="av-opt" id="av-dragon" onclick="selectAvatar('dragon')">🐉 Dragon</button>
-                <button class="av-opt" id="av-cyber" onclick="selectAvatar('cyber')">⚔️ Cyber</button>
-                <button class="av-opt" id="av-phantom" onclick="selectAvatar('phantom')">🦊 Phantom</button>
+              <div style="font-size:13.5px;color:var(--text-sub);margin-top:6px;" id="profBioText">Sovereign Explorer</div>
+              <div style="display:flex;gap:8px;margin-top:10px;">
+                <button class="icon-pill" style="height:32px;font-size:12px;" onclick="document.getElementById('pfpFileInput').click()">
+                  Upload Photo
+                </button>
+                <button class="icon-pill" style="height:32px;font-size:12px;color:#F87171;" id="removePfpBtn" onclick="removeProfilePhoto()">
+                  Remove Photo
+                </button>
               </div>
             </div>
           </div>
@@ -1260,14 +1398,20 @@ HTML_UI = """<!DOCTYPE html>
             </div>
             <div class="stat-box">
               <div class="stat-num" style="color:#A78BFA;" id="statMissions">0</div>
-              <div class="stat-lbl">Missions Done</div>
+              <div class="stat-lbl">Sessions Completed</div>
             </div>
           </div>
 
-          <div style="display:flex;gap:8px;margin-top:16px;">
-            <input id="bioInput" class="field" placeholder="Update status bio..." />
-            <button class="btn-primary" style="width:auto;white-space:nowrap;" onclick="saveProfile()">Save</button>
-            <button class="btn-ghost" style="width:auto;margin:0;color:#F87171;" onclick="logout()">Logout</button>
+          <div style="margin-top:18px;">
+            <label style="font-size:11.5px;font-weight:700;color:var(--text-sub);display:block;margin-bottom:6px;">BIO / STATUS</label>
+            <div style="display:flex;gap:8px;">
+              <input id="bioInput" class="field" placeholder="Write a short bio..." />
+              <button class="btn-primary" style="width:auto;white-space:nowrap;padding:12px 20px;" onclick="saveProfile()">Save</button>
+            </div>
+          </div>
+
+          <div style="margin-top:14px;padding-top:14px;border-top:1px solid var(--border-light);display:flex;justify-content:flex-end;">
+            <button class="btn-ghost" style="width:auto;padding:9px 18px;color:#F87171;" onclick="logout()">Sign Out</button>
           </div>
         </div>
 
@@ -1276,38 +1420,10 @@ HTML_UI = """<!DOCTYPE html>
           <div style="font-size:14px;font-weight:700;margin-bottom:8px;">🧠 Long-Term Cloud Memory</div>
           <div id="memBox" style="font-size:13px;color:var(--text-sub);line-height:1.7;">No memories stored yet.</div>
         </div>
-
-        <!-- Friends & Direct Messaging -->
-        <div class="glass-box">
-          <div style="font-size:14px;font-weight:700;margin-bottom:10px;">👥 Squad & Direct Messages</div>
-          <div style="display:flex;gap:8px;margin-bottom:12px;">
-            <input id="friendSearchInp" class="field" placeholder="Search exact username..." />
-            <button class="btn-primary" style="width:auto;white-space:nowrap;" onclick="searchExactFriend()">Find</button>
-          </div>
-          <div id="searchOut" style="margin-bottom:10px;"></div>
-          <div id="reqOut" style="margin-bottom:10px;"></div>
-
-          <div class="dm-grid">
-            <div style="border-right:1px solid var(--border-light);padding-right:10px;overflow-y:auto;">
-              <div style="font-size:11px;font-weight:700;color:var(--text-dim);margin-bottom:8px;">CONNECTED FRIENDS</div>
-              <div id="friendsContainer"></div>
-            </div>
-            <div style="display:flex;flex-direction:column;height:100%;">
-              <div id="dmTitle" style="font-size:12.5px;font-weight:700;padding-bottom:8px;border-bottom:1px solid var(--border-light);">
-                Select a friend to message
-              </div>
-              <div id="dmFeed" style="flex:1;overflow-y:auto;padding:10px 0;display:flex;flex-direction:column;gap:6px;"></div>
-              <div style="display:flex;gap:6px;">
-                <input id="dmText" class="field" style="padding:8px 12px;font-size:13px;" placeholder="Send DM..." onkeydown="if(event.key==='Enter') sendDM()" />
-                <button class="btn-primary" style="width:auto;padding:8px 14px;" onclick="sendDM()">Send</button>
-              </div>
-            </div>
-          </div>
-        </div>
       </div>
     </div>
 
-    <!-- Floating Glass Prompt Pad (Visible on Home Tab) -->
+    <!-- Floating Glass Prompt Pad (Home Tab Only) -->
     <div class="floating-pad-wrap" id="floatingPadWrap">
       <div class="floating-pad">
         <textarea id="promptInput" class="pad-textarea" rows="1" placeholder="Ask Sovereign anything — search, compute, remember, or build..." onkeydown="handleKey(event)"></textarea>
@@ -1326,11 +1442,14 @@ HTML_UI = """<!DOCTYPE html>
       </div>
     </div>
 
-    <!-- Instagram-Style Floating 3-Tab Bottom Dock -->
+    <!-- 4-Tab Bottom Navigation Dock: Home | Chat | Upgrade | Profile -->
     <div class="ig-dock-wrap">
       <nav class="ig-dock">
         <button class="ig-tab active" id="nav-home" onclick="switchTab('home')">
           <span>🏠</span><span>Home</span>
+        </button>
+        <button class="ig-tab" id="nav-chat" onclick="switchTab('chat')">
+          <span>💬</span><span>Chat</span>
         </button>
         <button class="ig-tab" id="nav-upgrade" onclick="switchTab('upgrade')">
           <span>⚡</span><span>Upgrade</span>
@@ -1343,7 +1462,7 @@ HTML_UI = """<!DOCTYPE html>
   </div>
 
 <script>
-  // --- Tactile Web Audio Synthesizer (Zero External Audio Lag) ---
+  // --- Satisfying Web Audio Synthesizer (Including Ultra-Crisp Bubble Pop!) ---
   let soundEnabled = true;
   let audioCtx = null;
 
@@ -1355,21 +1474,58 @@ HTML_UI = """<!DOCTYPE html>
   function toggleSound() {
     soundEnabled = !soundEnabled;
     document.getElementById('soundToggle').textContent = soundEnabled ? '🔊 SFX' : '🔇 Muted';
-    if (soundEnabled) playPopSound();
+    if (soundEnabled) playBubblePopSound(1.0);
   }
 
-  function playPopSound() {
+  // Realistic resonant water-droplet bubble pop sound
+  function playBubblePopSound(pitchScale = 1.0) {
+    if (!soundEnabled) return;
+    ensureAudio();
+    const now = audioCtx.currentTime;
+
+    // Main resonant bubble pitch sweep
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = 'sine';
+    const baseFreq = (280 + Math.random() * 140) * pitchScale;
+    osc.frequency.setValueAtTime(baseFreq, now);
+    osc.frequency.exponentialRampToValueAtTime(baseFreq * 3.1, now + 0.065);
+
+    gain.gain.setValueAtTime(0.001, now);
+    gain.gain.linearRampToValueAtTime(0.22, now + 0.008);
+    gain.gain.exponentialRampToValueAtTime(0.0008, now + 0.075);
+
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start(now);
+    osc.stop(now + 0.08);
+
+    // Subtle high harmonic snap
+    const snap = audioCtx.createOscillator();
+    const snapGain = audioCtx.createGain();
+    snap.type = 'triangle';
+    snap.frequency.setValueAtTime(baseFreq * 2.2, now);
+    snap.frequency.exponentialRampToValueAtTime(baseFreq * 4.5, now + 0.035);
+    snapGain.gain.setValueAtTime(0.08, now);
+    snapGain.gain.exponentialRampToValueAtTime(0.0008, now + 0.04);
+    snap.connect(snapGain);
+    snapGain.connect(audioCtx.destination);
+    snap.start(now);
+    snap.stop(now + 0.045);
+  }
+
+  function playClickSound() {
     if (!soundEnabled) return;
     ensureAudio();
     const osc = audioCtx.createOscillator();
     const gain = audioCtx.createGain();
     osc.type = 'sine';
-    osc.frequency.setValueAtTime(340, audioCtx.currentTime);
-    osc.frequency.exponentialRampToValueAtTime(620, audioCtx.currentTime + 0.09);
-    gain.gain.setValueAtTime(0.08, audioCtx.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.09);
+    osc.frequency.setValueAtTime(420, audioCtx.currentTime);
+    osc.frequency.exponentialRampToValueAtTime(680, audioCtx.currentTime + 0.06);
+    gain.gain.setValueAtTime(0.06, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.06);
     osc.connect(gain); gain.connect(audioCtx.destination);
-    osc.start(); osc.stop(audioCtx.currentTime + 0.09);
+    osc.start(); osc.stop(audioCtx.currentTime + 0.06);
   }
 
   function playChimeSound() {
@@ -1382,9 +1538,9 @@ HTML_UI = """<!DOCTYPE html>
       const t = audioCtx.currentTime + i * 0.06;
       osc.frequency.setValueAtTime(freq, t);
       gain.gain.setValueAtTime(0.07, t);
-      gain.gain.exponentialRampToValueAtTime(0.001, t + 0.28);
+      gain.gain.exponentialRampToValueAtTime(0.001, t + 0.25);
       osc.connect(gain); gain.connect(audioCtx.destination);
-      osc.start(t); osc.stop(t + 0.28);
+      osc.start(t); osc.stop(t + 0.25);
     });
   }
 
@@ -1404,11 +1560,12 @@ HTML_UI = """<!DOCTYPE html>
     });
   }
 
-  // --- 60fps Glowing Particle Background ---
-  const canvas = document.getElementById('particleCanvas');
+  // --- Interactive Floating Glossy Bubbles + Burst Physics ---
+  const canvas = document.getElementById('bubbleCanvas');
   const ctx = canvas.getContext('2d');
-  let particles = [];
-  let particleTheme = 'rgba(16, 185, 129, ';
+  let bubbles = [];
+  let burstEffects = [];
+  let bubbleColorRGB = '16, 185, 129';
 
   function resizeCanvas() {
     canvas.width = window.innerWidth;
@@ -1417,99 +1574,236 @@ HTML_UI = """<!DOCTYPE html>
   window.addEventListener('resize', resizeCanvas);
   resizeCanvas();
 
-  for (let i = 0; i < 65; i++) {
-    particles.push({
-      x: Math.random() * canvas.width,
-      y: Math.random() * canvas.height,
-      r: Math.random() * 2.1 + 0.6,
-      vx: (Math.random() - 0.5) * 0.35,
-      vy: -Math.random() * 0.45 - 0.12,
-      alpha: Math.random() * 0.55 + 0.15
+  function spawnBubble(randomY = false) {
+    const r = Math.random() * 22 + 14;
+    return {
+      x: Math.random() * (canvas.width - r * 2) + r,
+      y: randomY ? Math.random() * canvas.height : canvas.height + r + Math.random() * 80,
+      r: r,
+      vy: -(Math.random() * 0.65 + 0.35),
+      wobblePhase: Math.random() * Math.PI * 2,
+      wobbleSpeed: Math.random() * 0.02 + 0.01,
+      alpha: Math.random() * 0.28 + 0.22
+    };
+  }
+
+  for (let i = 0; i < 24; i++) {
+    bubbles.push(spawnBubble(true));
+  }
+
+  function triggerBubbleBurst(b) {
+    // Larger bubbles = deeper pop, smaller bubbles = higher crisp pop
+    const pitchScale = Math.max(0.75, Math.min(1.45, 28 / b.r));
+    playBubblePopSound(pitchScale);
+
+    const droplets = [];
+    for (let i = 0; i < 12; i++) {
+      const ang = (Math.PI * 2 * i) / 12 + (Math.random() - 0.5) * 0.3;
+      const spd = Math.random() * 3.5 + 1.8;
+      droplets.push({
+        x: b.x + Math.cos(ang) * (b.r * 0.5),
+        y: b.y + Math.sin(ang) * (b.r * 0.5),
+        vx: Math.cos(ang) * spd,
+        vy: Math.sin(ang) * spd,
+        r: Math.random() * 2.5 + 1.2
+      });
+    }
+    burstEffects.push({
+      x: b.x,
+      y: b.y,
+      radius: b.r * 0.7,
+      maxRadius: b.r * 2.1,
+      alpha: 0.85,
+      droplets
     });
   }
 
-  function animateParticles() {
+  function handleCanvasTap(clientX, clientY) {
+    for (let i = bubbles.length - 1; i >= 0; i--) {
+      const b = bubbles[i];
+      const dx = clientX - b.x;
+      const dy = clientY - b.y;
+      if (dx * dx + dy * dy <= (b.r + 12) * (b.r + 12)) {
+        triggerBubbleBurst(b);
+        bubbles[i] = spawnBubble(false);
+        break;
+      }
+    }
+  }
+
+  canvas.addEventListener('pointerdown', (e) => {
+    handleCanvasTap(e.clientX, e.clientY);
+  });
+
+  function animateBubbles() {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
-    for (const p of particles) {
-      p.x += p.vx;
-      p.y += p.vy;
-      if (p.y < -10) { p.y = canvas.height + 10; p.x = Math.random() * canvas.width; }
-      if (p.x < -10) p.x = canvas.width + 10;
-      if (p.x > canvas.width + 10) p.x = -10;
+
+    // Draw floating translucent glass bubbles
+    for (let i = 0; i < bubbles.length; i++) {
+      const b = bubbles[i];
+      b.y += b.vy;
+      b.wobblePhase += b.wobbleSpeed;
+      const drawX = b.x + Math.sin(b.wobblePhase) * 10;
+
+      if (b.y < -b.r - 20) {
+        bubbles[i] = spawnBubble(false);
+        continue;
+      }
+
+      // Radial translucent body
+      const grad = ctx.createRadialGradient(
+        drawX - b.r * 0.3, b.y - b.r * 0.3, b.r * 0.1,
+        drawX, b.y, b.r
+      );
+      grad.addColorStop(0, `rgba(255, 255, 255, ${b.alpha * 0.65})`);
+      grad.addColorStop(0.55, `rgba(${bubbleColorRGB}, ${b.alpha * 0.25})`);
+      grad.addColorStop(1, `rgba(${bubbleColorRGB}, ${b.alpha * 0.75})`);
 
       ctx.beginPath();
-      ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
-      ctx.fillStyle = particleTheme + p.alpha + ')';
-      ctx.shadowBlur = 10;
-      ctx.shadowColor = particleTheme + '0.8)';
+      ctx.arc(drawX, b.y, b.r, 0, Math.PI * 2);
+      ctx.fillStyle = grad;
+      ctx.fill();
+
+      ctx.lineWidth = 1.2;
+      ctx.strokeStyle = `rgba(${bubbleColorRGB}, ${b.alpha + 0.18})`;
+      ctx.stroke();
+
+      // Glossy specular highlight reflection
+      ctx.beginPath();
+      ctx.arc(drawX - b.r * 0.34, b.y - b.r * 0.34, b.r * 0.22, 0, Math.PI * 2);
+      ctx.fillStyle = `rgba(255, 255, 255, ${b.alpha + 0.28})`;
       ctx.fill();
     }
-    requestAnimationFrame(animateParticles);
+
+    // Draw burst shockwaves and droplets
+    for (let i = burstEffects.length - 1; i >= 0; i--) {
+      const ef = burstEffects[i];
+      ef.radius += (ef.maxRadius - ef.radius) * 0.22;
+      ef.alpha -= 0.048;
+
+      if (ef.alpha <= 0) {
+        burstEffects.splice(i, 1);
+        continue;
+      }
+
+      ctx.beginPath();
+      ctx.arc(ef.x, ef.y, ef.radius, 0, Math.PI * 2);
+      ctx.strokeStyle = `rgba(${bubbleColorRGB}, ${ef.alpha})`;
+      ctx.lineWidth = 2;
+      ctx.stroke();
+
+      for (const d of ef.droplets) {
+        d.x += d.vx;
+        d.y += d.vy;
+        d.vx *= 0.94;
+        d.vy *= 0.94;
+        ctx.beginPath();
+        ctx.arc(d.x, d.y, d.r, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(255, 255, 255, ${ef.alpha})`;
+        ctx.fill();
+      }
+    }
+
+    requestAnimationFrame(animateBubbles);
   }
-  animateParticles();
+  animateBubbles();
 
   function onModeChange() {
     const m = document.getElementById('modeSelect').value;
     const root = document.documentElement.style;
     if (m === 'brutal') {
-      particleTheme = 'rgba(245, 158, 11, ';
+      bubbleColorRGB = '245, 158, 11';
       root.setProperty('--accent', '#F59E0B');
       root.setProperty('--accent-glow', 'rgba(245, 158, 11, 0.25)');
     } else if (m === 'architect') {
-      particleTheme = 'rgba(139, 92, 246, ';
+      bubbleColorRGB = '139, 92, 246';
       root.setProperty('--accent', '#8B5CF6');
       root.setProperty('--accent-glow', 'rgba(139, 92, 246, 0.28)');
     } else if (m === 'overdrive') {
-      particleTheme = 'rgba(56, 189, 248, ';
+      bubbleColorRGB = '56, 189, 248';
       root.setProperty('--accent', '#38BDF8');
       root.setProperty('--accent-glow', 'rgba(56, 189, 248, 0.28)');
     } else {
-      particleTheme = 'rgba(16, 185, 129, ';
+      bubbleColorRGB = '16, 185, 129';
       root.setProperty('--accent', '#10B981');
       root.setProperty('--accent-glow', 'rgba(16, 185, 129, 0.25)');
     }
-    playPopSound();
+    playClickSound();
   }
 
-  // --- App State & API Logic ---
-  let token = localStorage.getItem('sov_token') || '';
-  let currentUser = null;
-  let currentSessionId = null;
-  let activeFriendId = null;
-  let selectedAvatar = 'dragon';
-  let dmInterval = null;
+  // --- Pro Auth Logic (Zero Glitch / Double-Submit Lock) ---
+  let authMode = 'login';
+  let authBusy = false;
 
-  const AVATARS = {
-    dragon: `<svg viewBox="0 0 80 80" width="76" height="76"><circle cx="40" cy="40" r="38" fill="#0F172A"/><path d="M25 58 C25 42, 55 42, 55 58" fill="#10B981"/><circle cx="40" cy="31" r="13" fill="#34D399"/><path d="M29 22 L22 12 M51 22 L58 12" stroke="#FBBF24" stroke-width="3" stroke-linecap="round"/><circle cx="35" cy="30" r="2.2" fill="#090A0D"/><circle cx="45" cy="30" r="2.2" fill="#090A0D"/></svg>`,
-    cyber: `<svg viewBox="0 0 80 80" width="76" height="76"><circle cx="40" cy="40" r="38" fill="#111827"/><path d="M22 60 C24 44, 56 44, 58 60" fill="#6366F1"/><circle cx="40" cy="31" r="13" fill="#A5B4FC"/><rect x="29" y="27" width="22" height="6" rx="3" fill="#38BDF8"/></svg>`,
-    phantom: `<svg viewBox="0 0 80 80" width="76" height="76"><circle cx="40" cy="40" r="38" fill="#1E1B4B"/><path d="M24 60 C24 43, 56 43, 56 60" fill="#F59E0B"/><polygon points="27,25 32,12 38,22" fill="#FBBF24"/><polygon points="53,25 48,12 42,22" fill="#FBBF24"/><circle cx="40" cy="32" r="12" fill="#FDE68A"/><circle cx="36" cy="31" r="2" fill="#111"/><circle cx="44" cy="31" r="2" fill="#111"/></svg>`
-  };
-
-  function headers() {
-    return { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token };
+  function setAuthMode(mode) {
+    authMode = mode;
+    document.getElementById('tabLoginBtn').classList.toggle('active', mode === 'login');
+    document.getElementById('tabRegBtn').classList.toggle('active', mode === 'register');
+    document.getElementById('authSubmitBtn').textContent = mode === 'login' ? 'Sign In' : 'Create Account';
+    document.getElementById('authErr').style.display = 'none';
   }
 
-  async function submitAuth(type) {
+  function togglePassVisibility() {
+    const inp = document.getElementById('authPass');
+    const btn = document.querySelector('.eye-btn');
+    if (inp.type === 'password') {
+      inp.type = 'text';
+      btn.textContent = 'Hide';
+    } else {
+      inp.type = 'password';
+      btn.textContent = 'Show';
+    }
+  }
+
+  async function handleAuthSubmit() {
+    if (authBusy) return;
     const username = document.getElementById('authUser').value.trim();
     const password = document.getElementById('authPass').value.trim();
     const errEl = document.getElementById('authErr');
+    const btn = document.getElementById('authSubmitBtn');
+
     errEl.style.display = 'none';
+    if (!username || !password) {
+      errEl.textContent = 'Please enter both username and password.';
+      errEl.style.display = 'block';
+      return;
+    }
+
+    authBusy = true;
+    btn.disabled = true;
+    btn.textContent = authMode === 'login' ? 'Signing in...' : 'Creating account...';
+
     try {
-      const res = await fetch('/api/auth/' + type, {
+      const res = await fetch('/api/auth/' + authMode, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ username, password })
       });
       const data = await res.json();
-      if (!res.ok) throw new Error(data.detail || 'Auth error');
+      if (!res.ok) throw new Error(data.detail || 'Authentication failed');
       token = data.token;
       localStorage.setItem('sov_token', token);
       playChimeSound();
-      boot();
+      await boot();
     } catch (e) {
       errEl.textContent = e.message;
       errEl.style.display = 'block';
+    } finally {
+      authBusy = false;
+      btn.disabled = false;
+      btn.textContent = authMode === 'login' ? 'Sign In' : 'Create Account';
     }
+  }
+
+  // --- App State & API ---
+  let token = localStorage.getItem('sov_token') || '';
+  let currentUser = null;
+  let currentSessionId = null;
+  let activeFriendId = null;
+  let dmInterval = null;
+
+  function headers() {
+    return { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token };
   }
 
   function logout() {
@@ -1519,20 +1813,32 @@ HTML_UI = """<!DOCTYPE html>
 
   async function boot() {
     if (!token) return;
-    const res = await fetch('/api/me', { headers: headers() });
-    if (!res.ok) { logout(); return; }
-    currentUser = await res.json();
-    document.getElementById('authScreen').style.display = 'none';
-    document.getElementById('appShell').style.display = 'flex';
-    refreshUserUI();
-    loadSessions();
+    try {
+      const res = await fetch('/api/me', { headers: headers() });
+      if (!res.ok) { logout(); return; }
+      currentUser = await res.json();
+      document.getElementById('authScreen').style.display = 'none';
+      document.getElementById('appShell').style.display = 'flex';
+      refreshUserUI();
+      loadSessions();
+    } catch (e) {
+      console.error('Boot error:', e);
+    }
+  }
+
+  function renderAvatarHtml(username, avatarData, sizePx, fontPx) {
+    const initial = (username || 'S').charAt(0).toUpperCase();
+    if (avatarData && avatarData.startsWith('data:image/')) {
+      return `<div class="pro-avatar" style="width:${sizePx}px;height:${sizePx}px;"><img src="${avatarData}" alt="pfp" /></div>`;
+    }
+    return `<div class="pro-avatar" style="width:${sizePx}px;height:${sizePx}px;font-size:${fontPx}px;">${escapeHtml(initial)}</div>`;
   }
 
   function getRankTitle(coins) {
-    if (coins >= 300) return '👑 MYTHIC SOVEREIGN';
-    if (coins >= 150) return '🔥 DRAGON ASCENDANT';
-    if (coins >= 50) return '⚔️ SPIRIT ADEPT';
-    return '🐉 SPIRIT INITIATE';
+    if (coins >= 300) return 'TIER IV · MYTHIC SOVEREIGN';
+    if (coins >= 150) return 'TIER III · ASCENDANT';
+    if (coins >= 50) return 'TIER II · ADEPT';
+    return 'TIER I · INITIATE';
   }
 
   function refreshUserUI() {
@@ -1542,17 +1848,23 @@ HTML_UI = """<!DOCTYPE html>
     document.getElementById('dailyCount').textContent = currentUser.daily_coins_earned || 0;
 
     document.getElementById('profName').textContent = '@' + currentUser.username;
+    document.getElementById('igHeaderUser').textContent = '@' + currentUser.username;
     document.getElementById('profBioText').textContent = currentUser.bio || 'Sovereign Explorer';
     document.getElementById('bioInput').value = currentUser.bio || '';
     document.getElementById('profRank').textContent = getRankTitle(coins);
     document.getElementById('statCoins').textContent = coins;
     document.getElementById('statMissions').textContent = currentUser.session_count || 0;
 
-    selectedAvatar = currentUser.avatar_seed || 'dragon';
-    document.getElementById('avatarDisplay').innerHTML = AVATARS[selectedAvatar] || AVATARS.dragon;
-    ['dragon', 'cyber', 'phantom'].forEach(k => {
-      document.getElementById('av-' + k).classList.toggle('active', k === selectedAvatar);
-    });
+    // Render Gallery PFP or Clean Initial
+    const slot = document.getElementById('profileAvatarSlot');
+    const initial = (currentUser.username || 'S').charAt(0).toUpperCase();
+    if (currentUser.avatar_data) {
+      slot.innerHTML = `<img src="${currentUser.avatar_data}" alt="Profile Photo" />`;
+      document.getElementById('removePfpBtn').style.display = 'inline-flex';
+    } else {
+      slot.innerHTML = escapeHtml(initial);
+      document.getElementById('removePfpBtn').style.display = 'none';
+    }
 
     const modes = currentUser.unlocked_modes || ['standard'];
     document.getElementById('statModes').textContent = `${modes.length} / 4`;
@@ -1581,17 +1893,71 @@ HTML_UI = """<!DOCTYPE html>
 
     const memBox = document.getElementById('memBox');
     if (currentUser.memories && currentUser.memories.length) {
-      memBox.innerHTML = currentUser.memories.map(m => `<div>• ${escapeHtml(m.fact)}</div>`).join('');
+      memBox.innerHTML = currentUser.memories.map(m => `
+        <div class="mem-row">
+          <span>• ${escapeHtml(m.fact)}</span>
+          <span style="cursor:pointer;color:#F87171;padding:0 6px;font-weight:700;" onclick="delMemory(${m.id})">×</span>
+        </div>
+      `).join('');
+    } else {
+      memBox.innerHTML = 'No memories stored yet.';
     }
   }
 
-  function selectAvatar(seed) {
-    selectedAvatar = seed;
-    document.getElementById('avatarDisplay').innerHTML = AVATARS[seed];
-    ['dragon', 'cyber', 'phantom'].forEach(k => {
-      document.getElementById('av-' + k).classList.toggle('active', k === seed);
+  // Gallery Image Upload + Auto Resize/Compress for Instant Loading
+  function handleGalleryUpload(event) {
+    const file = event.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = function(e) {
+      const img = new Image();
+      img.onload = async function() {
+        const c = document.createElement('canvas');
+        const size = 240;
+        c.width = size;
+        c.height = size;
+        const cctx = c.getContext('2d');
+        const minSide = Math.min(img.width, img.height);
+        const sx = (img.width - minSide) / 2;
+        const sy = (img.height - minSide) / 2;
+        cctx.drawImage(img, sx, sy, minSide, minSide, 0, 0, size, size);
+        const compressedDataUrl = c.toDataURL('image/jpeg', 0.82);
+
+        const res = await fetch('/api/me/profile', {
+          method: 'POST',
+          headers: headers(),
+          body: JSON.stringify({
+            bio: document.getElementById('bioInput').value,
+            avatar_data: compressedDataUrl
+          })
+        });
+        if (res.ok) {
+          currentUser.avatar_data = compressedDataUrl;
+          refreshUserUI();
+          playChimeSound();
+        }
+      };
+      img.src = e.target.result;
+    };
+    reader.readAsDataURL(file);
+  }
+
+  async function removeProfilePhoto() {
+    await fetch('/api/me/profile', {
+      method: 'POST',
+      headers: headers(),
+      body: JSON.stringify({ bio: document.getElementById('bioInput').value, avatar_data: '' })
     });
-    playPopSound();
+    currentUser.avatar_data = '';
+    refreshUserUI();
+    playClickSound();
+  }
+
+  async function delMemory(id) {
+    await fetch('/api/memories/' + id, { method: 'DELETE', headers: headers() });
+    currentUser.memories = currentUser.memories.filter(m => m.id !== id);
+    playClickSound();
+    refreshUserUI();
   }
 
   async function saveProfile() {
@@ -1599,35 +1965,42 @@ HTML_UI = """<!DOCTYPE html>
     await fetch('/api/me/profile', {
       method: 'POST',
       headers: headers(),
-      body: JSON.stringify({ bio, avatar_seed: selectedAvatar })
+      body: JSON.stringify({ bio })
     });
     currentUser.bio = bio;
-    currentUser.avatar_seed = selectedAvatar;
     refreshUserUI();
     playChimeSound();
   }
 
   function switchTab(tab) {
-    playPopSound();
+    playClickSound();
     document.getElementById('tabHome').style.display = tab === 'home' ? 'flex' : 'none';
+    document.getElementById('tabChat').style.display = tab === 'chat' ? 'flex' : 'none';
     document.getElementById('tabUpgrade').style.display = tab === 'upgrade' ? 'flex' : 'none';
     document.getElementById('tabProfile').style.display = tab === 'profile' ? 'flex' : 'none';
     document.getElementById('floatingPadWrap').style.display = tab === 'home' ? 'flex' : 'none';
 
-    ['home', 'upgrade', 'profile'].forEach(t => {
+    ['home', 'chat', 'upgrade', 'profile'].forEach(t => {
       document.getElementById('nav-' + t).classList.toggle('active', t === tab);
     });
     document.getElementById('historyDrawer').classList.remove('open');
 
     if (dmInterval) { clearInterval(dmInterval); dmInterval = null; }
-    if (tab === 'profile') {
+    if (tab === 'chat') {
       loadFriends();
-      dmInterval = setInterval(() => { if (activeFriendId) loadDMs(activeFriendId); }, 3500);
+      dmInterval = setInterval(() => {
+        if (!document.hidden) {
+          if (activeFriendId) loadDMs(activeFriendId);
+          else loadFriends();
+        }
+      }, 3500);
+    } else if (tab === 'profile') {
+      boot();
     }
   }
 
   function toggleDrawer() {
-    playPopSound();
+    playClickSound();
     document.getElementById('historyDrawer').classList.toggle('open');
   }
 
@@ -1651,7 +2024,7 @@ HTML_UI = """<!DOCTYPE html>
       <div class="hero-center" id="heroScreen">
         <div class="hero-glow-tag">⚡ Multi-Tool Autonomous Core Active</div>
         <h1 class="hero-title">Command Sovereign AI</h1>
-        <p class="hero-sub">Live internet intelligence, symbolic mathematics, permanent cloud memory, and file synthesis. Earn Spiritual Coins with every task to upgrade your AI cores.</p>
+        <p class="hero-sub">Live internet intelligence, symbolic mathematics, permanent cloud memory, and file synthesis. Tap background bubbles anytime to pop them.</p>
         <div class="quick-grid">
           <div class="quick-card" onclick="quickPrompt('Search the latest AI breakthroughs today and give bullet points.')">
             <div style="font-weight:700;font-size:13.5px;margin-bottom:4px;">🌐 Live Web Search</div>
@@ -1687,7 +2060,14 @@ HTML_UI = """<!DOCTYPE html>
     const msgs = await res.json();
     const feed = document.getElementById('chatFeed');
     feed.innerHTML = '';
-    msgs.forEach(m => renderMessage(m.role, m.content, JSON.parse(m.tools_used || '[]')));
+    msgs.forEach(m => {
+      renderMessage(
+        m.role,
+        m.content,
+        JSON.parse(m.tools_used || '[]'),
+        JSON.parse(m.files_json || '[]')
+      );
+    });
   }
 
   async function delSession(ev, id) {
@@ -1711,8 +2091,8 @@ HTML_UI = """<!DOCTYPE html>
 
     document.getElementById('heroScreen')?.remove();
     inp.value = '';
-    playPopSound();
-    renderMessage('user', text, []);
+    playClickSound();
+    renderMessage('user', text, [], []);
 
     const btn = document.getElementById('sendBtn');
     btn.disabled = true;
@@ -1741,7 +2121,7 @@ HTML_UI = """<!DOCTYPE html>
 
       if (!res.ok) throw new Error(data.detail || 'Server error');
       currentSessionId = data.session_id;
-      renderMessage('assistant', data.reply, data.tools_used || []);
+      renderMessage('assistant', data.reply, data.tools_used || [], data.files || []);
       playChimeSound();
 
       if (data.coins) {
@@ -1753,13 +2133,13 @@ HTML_UI = """<!DOCTYPE html>
       loadSessions();
     } catch (e) {
       document.getElementById(loadId)?.remove();
-      renderMessage('assistant', 'Error: ' + e.message, []);
+      renderMessage('assistant', 'Error: ' + e.message, [], []);
     } finally {
       btn.disabled = false;
     }
   }
 
-  function renderMessage(role, content, tools) {
+  function renderMessage(role, content, tools, files) {
     const feed = document.getElementById('chatFeed');
     if (role === 'user') {
       const div = document.createElement('div');
@@ -1767,16 +2147,8 @@ HTML_UI = """<!DOCTYPE html>
       div.textContent = content;
       feed.appendChild(div);
     } else {
-      const files = [];
-      const regex = /\[FILE_READY::(.*?)::([\s\S]*?)\]/g;
-      let m;
-      while ((m = regex.exec(content)) !== null) {
-        files.push({ filename: m[1], content: m[2] });
-      }
-      const clean = content.replace(regex, '').trim();
-
-      const chips = tools.map(t => `<span class="tool-chip">✓ ${escapeHtml(t)}</span>`).join('');
-      const dlCards = files.map(f => {
+      const chips = (tools || []).map(t => `<span class="tool-chip">✓ ${escapeHtml(t)}</span>`).join('');
+      const dlCards = (files || []).map(f => {
         const b64 = btoa(unescape(encodeURIComponent(f.content)));
         return `<div class="file-dl">
           <span style="font-size:12.5px;font-family:'JetBrains Mono',monospace;">📄 ${escapeHtml(f.filename)}</span>
@@ -1790,9 +2162,24 @@ HTML_UI = """<!DOCTYPE html>
         <div class="ai-orb">S</div>
         <div class="ai-text">
           <div>${chips}</div>
-          <div>${marked.parse(clean)}</div>
+          <div>${marked.parse(content)}</div>
           ${dlCards}
         </div>`;
+
+      div.querySelectorAll('pre').forEach(pre => {
+        const copyBtn = document.createElement('button');
+        copyBtn.className = 'copy-code-btn';
+        copyBtn.textContent = 'Copy';
+        copyBtn.onclick = () => {
+          const codeEl = pre.querySelector('code');
+          navigator.clipboard.writeText(codeEl ? codeEl.innerText : pre.innerText);
+          copyBtn.textContent = 'Copied!';
+          playClickSound();
+          setTimeout(() => copyBtn.textContent = 'Copy', 1500);
+        };
+        pre.appendChild(copyBtn);
+      });
+
       feed.appendChild(div);
     }
     scrollBottom();
@@ -1804,7 +2191,7 @@ HTML_UI = """<!DOCTYPE html>
     a.href = URL.createObjectURL(new Blob([txt], { type: 'text/plain;charset=utf-8' }));
     a.download = name;
     a.click();
-    playPopSound();
+    playClickSound();
   }
 
   function scrollBottom() {
@@ -1826,6 +2213,7 @@ HTML_UI = """<!DOCTYPE html>
     refreshUserUI();
   }
 
+  // --- Instagram-Style Dedicated Chat Tab Logic ---
   async function searchExactFriend() {
     const q = document.getElementById('friendSearchInp').value.trim();
     if (!q) return;
@@ -1833,39 +2221,70 @@ HTML_UI = """<!DOCTYPE html>
     const data = await res.json();
     const out = document.getElementById('searchOut');
     if (!data.user) {
-      out.innerHTML = `<div style="font-size:12.5px;color:var(--text-sub);">No exact user found.</div>`;
+      out.innerHTML = `<div style="font-size:12.5px;color:var(--text-sub);padding:4px;">No exact user found.</div>`;
       return;
     }
     const u = data.user;
     let btn = `<button class="exec-btn" onclick="sendFriendReq('${escapeHtml(u.username)}')">+ Add Friend</button>`;
-    if (data.relation) btn = `<span style="font-size:12px;color:#34D399;">Status: ${data.relation.status}</span>`;
-    out.innerHTML = `<div style="display:flex;justify-content:space-between;align-items:center;padding:10px;background:rgba(255,255,255,0.04);border-radius:12px;">
-      <span><strong>@${escapeHtml(u.username)}</strong> · <span style="color:#FBBF24;">${u.spiritual_coins} Coins</span></span>
-      ${btn}
-    </div>`;
+    if (data.relation) btn = `<span style="font-size:12px;color:#34D399;font-weight:600;">${data.relation.status.toUpperCase()}</span>`;
+    out.innerHTML = `
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:10px 12px;background:rgba(255,255,255,0.05);border-radius:14px;">
+        <div style="display:flex;align-items:center;gap:10px;">
+          ${renderAvatarHtml(u.username, u.avatar_data, 38, 15)}
+          <div>
+            <div style="font-weight:700;font-size:13.5px;">@${escapeHtml(u.username)}</div>
+            <div style="font-size:11.5px;color:var(--text-sub);">${escapeHtml(u.bio || '')}</div>
+          </div>
+        </div>
+        ${btn}
+      </div>`;
   }
 
   async function sendFriendReq(username) {
     await fetch('/api/friends/request', { method: 'POST', headers: headers(), body: JSON.stringify({ username }) });
-    playPopSound();
+    playClickSound();
     searchExactFriend();
   }
 
   async function loadFriends() {
     const res = await fetch('/api/friends', { headers: headers() });
     const data = await res.json();
+
     document.getElementById('reqOut').innerHTML = data.incoming.map(r => `
-      <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 12px;background:rgba(16,185,129,0.1);border-radius:10px;margin-bottom:6px;">
-        <span style="font-size:12.5px;">Request from <strong>@${escapeHtml(r.username)}</strong></span>
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:9px 12px;background:rgba(16,185,129,0.1);border:1px solid rgba(16,185,129,0.25);border-radius:12px;margin-bottom:6px;">
+        <div style="display:flex;align-items:center;gap:9px;">
+          ${renderAvatarHtml(r.username, r.avatar_data, 32, 13)}
+          <span style="font-size:12.5px;">Request from <strong>@${escapeHtml(r.username)}</strong></span>
+        </div>
         <div style="display:flex;gap:6px;">
-          <button class="exec-btn" style="padding:4px 10px;font-size:11.5px;" onclick="respondFriend(${r.friendship_id},'accept')">Accept</button>
-          <button class="btn-ghost" style="width:auto;margin:0;padding:4px 10px;font-size:11.5px;" onclick="respondFriend(${r.friendship_id},'decline')">Decline</button>
+          <button class="exec-btn" style="padding:5px 11px;font-size:11.5px;" onclick="respondFriend(${r.friendship_id},'accept')">Accept</button>
+          <button class="btn-ghost" style="width:auto;padding:5px 11px;font-size:11.5px;" onclick="respondFriend(${r.friendship_id},'decline')">Decline</button>
         </div>
       </div>`).join('');
 
-    document.getElementById('friendsContainer').innerHTML = data.friends.length
-      ? data.friends.map(f => `<div class="sess-item ${f.id === activeFriendId ? 'active' : ''}" onclick="openDM('${f.id}','${escapeHtml(f.username)}')">@${escapeHtml(f.username)}</div>`).join('')
-      : `<div style="font-size:12px;color:var(--text-dim);">No friends yet.</div>`;
+    const listEl = document.getElementById('igFriendsList');
+    if (!data.friends.length) {
+      listEl.innerHTML = `<div style="text-align:center;padding:45px 20px;color:var(--text-dim);font-size:13px;">
+        No friends connected yet. Search a username above to start messaging.
+      </div>`;
+      return;
+    }
+
+    listEl.innerHTML = data.friends.map(f => `
+      <div class="ig-friend-row" onclick="openIGThread('${f.id}', '${escapeHtml(f.username)}', '${f.avatar_data || ''}')">
+        ${renderAvatarHtml(f.username, f.avatar_data, 48, 18)}
+        <div style="flex:1;min-width:0;">
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <span style="font-weight:700;font-size:14.5px;color:#FFF;">@${escapeHtml(f.username)}</span>
+            <span style="font-size:11px;color:#FBBF24;font-weight:600;">${f.spiritual_coins} Coins</span>
+          </div>
+          <div style="font-size:12.5px;color:var(--text-sub);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px;">
+            ${escapeHtml(f.last_message || 'Tap to message')}
+          </div>
+        </div>
+        <span style="color:var(--text-dim);font-size:16px;">›</span>
+      </div>
+    `).join('');
   }
 
   async function respondFriend(id, action) {
@@ -1874,23 +2293,34 @@ HTML_UI = """<!DOCTYPE html>
     loadFriends();
   }
 
-  function openDM(id, name) {
+  function openIGThread(id, name, avatarData) {
     activeFriendId = id;
+    playClickSound();
+    document.getElementById('igInboxView').style.display = 'none';
+    document.getElementById('igThreadView').style.display = 'flex';
     document.getElementById('dmTitle').textContent = '@' + name;
+    document.getElementById('threadAvatarWrap').innerHTML = renderAvatarHtml(name, avatarData, 36, 14);
     loadDMs(id);
+  }
+
+  function closeIGThread() {
+    activeFriendId = null;
+    playClickSound();
+    document.getElementById('igThreadView').style.display = 'none';
+    document.getElementById('igInboxView').style.display = 'flex';
+    loadFriends();
   }
 
   async function loadDMs(id) {
     const res = await fetch('/api/dm/' + id, { headers: headers() });
     const msgs = await res.json();
     const feed = document.getElementById('dmFeed');
+    const wasAtBottom = feed.scrollHeight - feed.scrollTop <= feed.clientHeight + 60;
     feed.innerHTML = msgs.map(m => `
-      <div style="align-self:${m.sender_id === currentUser.id ? 'flex-end' : 'flex-start'};
-        background:${m.sender_id === currentUser.id ? 'rgba(16,185,129,0.25)' : 'rgba(255,255,255,0.07)'};
-        padding:7px 12px;border-radius:12px;font-size:13px;max-width:78%;">
+      <div class="${m.sender_id === currentUser.id ? 'dm-bubble-me' : 'dm-bubble-them'}">
         ${escapeHtml(m.content)}
       </div>`).join('');
-    feed.scrollTop = feed.scrollHeight;
+    if (wasAtBottom) feed.scrollTop = feed.scrollHeight;
   }
 
   async function sendDM() {
@@ -1899,7 +2329,7 @@ HTML_UI = """<!DOCTYPE html>
     const content = inp.value.trim();
     if (!content) return;
     inp.value = '';
-    playPopSound();
+    playClickSound();
     await fetch('/api/dm', { method: 'POST', headers: headers(), body: JSON.stringify({ receiver_id: activeFriendId, content }) });
     loadDMs(activeFriendId);
   }
